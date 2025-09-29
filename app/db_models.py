@@ -117,7 +117,7 @@ class LiquidationHistory(Base):
     
     # Liquidation participants
     liquidator = Column(String, index=True)
-    borrower = Column(String, nullable=False, index=True)
+    borrower = Column(String, index=True)
     
     # Asset information
     collateral_asset = Column(String)
