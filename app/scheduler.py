@@ -106,7 +106,7 @@ def _load_dune_table(namespace: str, endpoint: str, env_var_key: str):
 def start_scheduler():
     """Start the background scheduler"""
     settings = get_settings()
-    interval_minutes = getattr(settings, 'SCHEDULE_INTERVAL_MINUTES', 15)
+    interval_minutes = getattr(settings, 'SCHEDULE_INTERVAL_MINUTES', 1440)
     
     scheduler.add_job(job_run, "interval", minutes=interval_minutes, id="aave_risk_job")
     scheduler.start()

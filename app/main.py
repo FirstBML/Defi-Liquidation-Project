@@ -1,48 +1,47 @@
-# main.py
-
-# app/main.py
-
+"""
+Minimal Working FastAPI Main Application
+Replace your current app/main.py with this
+"""
 from fastapi import FastAPI
-from .api import router as api_router  # import router from your Liquidation/api.py
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
-app = FastAPI(title="Liquidation Risk API")
+# Load environment variables
+load_dotenv()
 
-# Register API routes
-app.include_router(api_router)
+# Create FastAPI app
+app = FastAPI(
+    title="DeFi Liquidation Risk System",
+    description="Early-warning system for AAVE lending protocol",
+    version="1.0.0"
+)
+
+# Add CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Import and include the API router
+from .api import router as api_router
+
+app.include_router(api_router, prefix="/api", tags=["API"])
 
 @app.get("/")
-def root():
-    return {"message": "Liquidation Risk API is running"}
-
-
-"""
-import os
-import uvicorn
-from fastapi import FastAPI
-from app.api import router as api_router
-from app.scheduler import start_scheduler, stop_scheduler
-
-app = FastAPI(title="Aave Risk Early-Warning System")
-
-# include API routes under /api
-app.include_router(api_router, prefix="/api")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "DeFi Liquidation Risk System",
+        "status": "running",
+        "documentation": "/docs",
+        "api_base": "/api"
+    }
 
 @app.on_event("startup")
-async def on_startup():
-    # start scheduler background job
-    start_scheduler()
-    print("🚀 Scheduler started")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    stop_scheduler()
-    print("🛑 Scheduler stopped")
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "aave-risk"}
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)
-"""
-
+async def startup():
+    print("Server starting...")
+    print("Documentation: http://127.0.0.1:8000/docs")
+    print("API endpoints: http://127.0.0.1:8000/api")

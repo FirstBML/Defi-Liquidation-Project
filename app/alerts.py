@@ -56,16 +56,39 @@ def send_email_alert(subject: str, body: str) -> bool:
         return False
 
 
+def send_telegram_alert(message: str) -> bool:
+    """Send an alert message via Telegram bot."""
+    if not (settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID):
+        logger.info("Telegram bot token or chat ID not configured")
+        return False
+
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+
+    try:
+        r = requests.post(url, data=payload, timeout=10)
+        if r.status_code == 200:
+            logger.info("Telegram alert sent successfully")
+            return True
+        logger.error(f"Telegram failed: {r.status_code} {r.text[:200]}")
+    except Exception:
+        logger.exception("Telegram send failed")
+
+    return False
+
+
 def notify_critical_alerts(alerts: Dict[str, Any]) -> None:
-    """Send critical alerts via Slack and Email."""
+    """Send critical alerts via Slack, Email, and Telegram."""
     text = json.dumps(alerts, indent=2, default=str)
     logger.warning("CRITICAL ALERTS: %s", text)
 
-    # Try Slack first
     slack_ok = send_slack_alert(f"🚨 CRITICAL AAVE ALERT 🚨\n{text}")
-
-    # Always try email as backup
     email_ok = send_email_alert("🚨 AAVE Risk Alerts", text)
+    telegram_ok = send_telegram_alert(f"🚨 CRITICAL AAVE ALERT 🚨\n{text}")
 
-    if not (slack_ok or email_ok):
+    if not (slack_ok or email_ok or telegram_ok):
         logger.error("No alert was successfully delivered")
