@@ -1,3 +1,5 @@
+#main.py
+
 """
 Minimal Working FastAPI Main Application
 Replace your current app/main.py with this
@@ -5,6 +7,9 @@ Replace your current app/main.py with this
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+# Import and include the API router
+from .api import router as api_router
 
 # Load environment variables
 load_dotenv()
@@ -25,8 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Import and include the API router
-from .api import router as api_router
 
 app.include_router(api_router, prefix="/api", tags=["API"])
 

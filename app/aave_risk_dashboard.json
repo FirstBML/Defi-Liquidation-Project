@@ -1,0 +1,641 @@
+{
+  "timestamp": "2025-10-03T11:36:08.743209",
+  "summary": {
+    "total_chains": 5,
+    "total_reserves": 125,
+    "high_risk_count": 6
+  },
+  "alerts": [
+    {
+      "level": "CRITICAL",
+      "chain": "ethereum",
+      "symbol": "LUSD",
+      "type": "Extreme Borrow Rate",
+      "value": "29.3%",
+      "details": "LTV: 0.0%, Frozen: False"
+    },
+    {
+      "level": "CRITICAL",
+      "chain": "polygon",
+      "symbol": "BAL",
+      "type": "Extreme Borrow Rate",
+      "value": "144.9%",
+      "details": "LTV: 0.0%, Frozen: True"
+    },
+    {
+      "level": "CRITICAL",
+      "chain": "avalanche",
+      "symbol": "FRAX",
+      "type": "Extreme Borrow Rate",
+      "value": "39.0%",
+      "details": "LTV: 0.0%, Frozen: False"
+    },
+    {
+      "level": "CRITICAL",
+      "chain": "avalanche",
+      "symbol": "MAI",
+      "type": "Extreme Borrow Rate",
+      "value": "125.8%",
+      "details": "LTV: 0.0%, Frozen: True"
+    },
+    {
+      "level": "HIGH",
+      "chain": "ethereum",
+      "symbol": "SNX",
+      "type": "High Borrow Rate",
+      "value": "12.7%",
+      "details": "LTV: 0.0%"
+    },
+    {
+      "level": "HIGH",
+      "chain": "avalanche",
+      "symbol": "EURC",
+      "type": "High Borrow Rate",
+      "value": "10.2%",
+      "details": "LTV: 75.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "WETH",
+      "type": "Low Safety Margin",
+      "value": "2.5%",
+      "details": "LTV: 80.5%, Liq: 83.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "wstETH",
+      "type": "Low Safety Margin",
+      "value": "2.5%",
+      "details": "LTV: 78.5%, Liq: 81.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "USDC",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "LINK",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 66.0%, Liq: 71.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "cbETH",
+      "type": "Low Safety Margin",
+      "value": "4.0%",
+      "details": "LTV: 75.0%, Liq: 79.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "USDT",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "rETH",
+      "type": "Low Safety Margin",
+      "value": "4.0%",
+      "details": "LTV: 75.0%, Liq: 79.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "UNKNOWN",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 65.0%, Liq: 70.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "BAL",
+      "type": "Low Safety Margin",
+      "value": "2.0%",
+      "details": "LTV: 57.0%, Liq: 59.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "sDAI",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PYUSD",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "weETH",
+      "type": "Low Safety Margin",
+      "value": "2.5%",
+      "details": "LTV: 77.5%, Liq: 80.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "osETH",
+      "type": "Low Safety Margin",
+      "value": "2.5%",
+      "details": "LTV: 72.5%, Liq: 75.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "USDe",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 72.0%, Liq: 75.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "ETHx",
+      "type": "Low Safety Margin",
+      "value": "2.5%",
+      "details": "LTV: 74.5%, Liq: 77.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "sUSDe",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 72.0%, Liq: 75.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "USDS",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "rsETH",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 72.0%, Liq: 75.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "eBTC",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 67.0%, Liq: 72.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-eUSDE-29MAY2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-sUSDE-31JUL2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-USDe-31JUL2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-eUSDE-14AUG2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "eUSDe",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "EURC",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-sUSDE-25SEP2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-USDe-25SEP2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "tETH",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "ezETH",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-sUSDE-27NOV2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "ethereum",
+      "symbol": "PT-USDe-27NOV2025",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "polygon",
+      "symbol": "LINK",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 66.0%, Liq: 71.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "polygon",
+      "symbol": "WETH",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 80.0%, Liq: 83.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "polygon",
+      "symbol": "WPOL",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 68.0%, Liq: 73.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "polygon",
+      "symbol": "wstETH",
+      "type": "Low Safety Margin",
+      "value": "4.0%",
+      "details": "LTV: 75.0%, Liq: 79.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "USDC",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "WETH",
+      "type": "Low Safety Margin",
+      "value": "4.0%",
+      "details": "LTV: 80.0%, Liq: 84.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "USD\u20ae0",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "wstETH",
+      "type": "Low Safety Margin",
+      "value": "4.0%",
+      "details": "LTV: 75.0%, Liq: 79.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "USDC",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "weETH",
+      "type": "Low Safety Margin",
+      "value": "2.0%",
+      "details": "LTV: 75.0%, Liq: 77.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "ezETH",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "arbitrum",
+      "symbol": "rsETH",
+      "type": "Low Safety Margin",
+      "value": "0.1%",
+      "details": "LTV: 0.1%, Liq: 0.1%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "optimism",
+      "symbol": "LINK",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 66.0%, Liq: 71.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "optimism",
+      "symbol": "USDC",
+      "type": "Low Safety Margin",
+      "value": "3.5%",
+      "details": "LTV: 75.0%, Liq: 78.5%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "optimism",
+      "symbol": "WETH",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 80.0%, Liq: 83.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "optimism",
+      "symbol": "USDT",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "optimism",
+      "symbol": "wstETH",
+      "type": "Low Safety Margin",
+      "value": "4.0%",
+      "details": "LTV: 75.0%, Liq: 79.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "optimism",
+      "symbol": "USDC",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "LINK.e",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 66.0%, Liq: 71.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "USDC",
+      "type": "Low Safety Margin",
+      "value": "4.5%",
+      "details": "LTV: 75.0%, Liq: 79.5%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "WETH.e",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 80.0%, Liq: 83.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "USDt",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "WAVAX",
+      "type": "Low Safety Margin",
+      "value": "5.0%",
+      "details": "LTV: 68.0%, Liq: 73.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "AUSD",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 69.0%, Liq: 72.0%"
+    },
+    {
+      "level": "MEDIUM",
+      "chain": "avalanche",
+      "symbol": "EURC",
+      "type": "Low Safety Margin",
+      "value": "3.0%",
+      "details": "LTV: 75.0%, Liq: 78.0%"
+    },
+    {
+      "level": "INFO",
+      "chain": "ethereum",
+      "symbol": "STG",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "ethereum",
+      "symbol": "KNC",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "ethereum",
+      "symbol": "FXS",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "CRV",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "SUSHI",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "BAL",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "DPI",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "jEUR",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "EURA",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "miMATIC",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "polygon",
+      "symbol": "stMATIC",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "arbitrum",
+      "symbol": "EURS",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "arbitrum",
+      "symbol": "MAI",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "optimism",
+      "symbol": "MAI",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "avalanche",
+      "symbol": "WBTC.e",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    },
+    {
+      "level": "INFO",
+      "chain": "avalanche",
+      "symbol": "MAI",
+      "type": "Frozen Reserve",
+      "value": "FROZEN",
+      "details": "Reserve operations paused"
+    }
+  ],
+  "chains": {
+    "ethereum": {
+      "reserve_count": 55,
+      "high_risk_assets": [
+        "LUSD",
+        "SNX"
+      ],
+      "frozen_count": 
