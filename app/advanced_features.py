@@ -1,3 +1,4 @@
+# advanced_features.py
 """
 Advanced features for DeFi Risk System - Integrated with existing alerts and config
 """

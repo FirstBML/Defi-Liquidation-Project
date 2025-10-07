@@ -88,7 +88,7 @@ class Position(Base):
     enhanced_health_factor = Column(Float)
     risk_category = Column(String)
     current_ltv = Column(Float)
-    liquidation_threshold = Column(Float)
+    #liquidation_threshold = Column(Float)
     liquidation_price = Column(Float)
     price_drop_to_liquidation_pct = Column(Float)
     position_size_category = Column(String)
@@ -126,6 +126,7 @@ class LiquidationHistory(Base):
     
     total_collateral_seized = Column(Float)
     total_debt_normalized = Column(Float)
+    liquidated_collateral_usd = Column(Float)
     liquidation_count = Column(Integer)
     avg_debt_per_event = Column(Float)
     unique_liquidators = Column(Integer)

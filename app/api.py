@@ -15,6 +15,57 @@ from .config import get_settings
 
 import logging
 
+# Add this at the top of api.py after imports
+FALLBACK_LIQUIDATION_THRESHOLDS = {
+    # Ethereum mainnet tokens
+    'WETH': 0.825, 'WBTC': 0.70, 'USDC': 0.875, 'DAI': 0.77,
+    'USDT': 0.80, 'LINK': 0.70, 'AAVE': 0.66, 'UNI': 0.70,
+    'WMATIC': 0.70, 'stETH': 0.825, 'wstETH': 0.825,
+    
+    # Polygon tokens
+    'MATIC': 0.70, 'MaticX': 0.70, 'WPOL': 0.70,
+    
+    # Arbitrum/Optimism
+    'ARB': 0.70, 'OP': 0.70,
+    
+    # Avalanche
+    'AVAX': 0.70, 'WAVAX': 0.70,
+    
+    # Celo-specific tokens (add more as needed)
+    'CELO': 0.70, 'cUSD': 0.85, 'cEUR': 0.85, 'cREAL': 0.85,
+    'USDC.e': 0.875,
+    
+    # Pendle tokens
+    'PT-sUSDE-27NOV2025': 0.75,
+    
+    # Default for unknown tokens
+    'DEFAULT': 0.75
+}
+
+def get_liquidation_threshold(db: Session, chain: str, token_symbol: str) -> tuple[float, str]:
+    """
+    Get liquidation threshold with fallback logic
+    Returns: (threshold_value, source)
+    source can be: 'reserve', 'fallback', 'default'
+    """
+    # Try to get from Reserve table (latest record)
+    reserve = db.query(Reserve).filter(
+        Reserve.chain == chain,
+        Reserve.token_symbol == token_symbol,
+        Reserve.is_active == True
+    ).order_by(Reserve.query_time.desc()).first()
+    
+    if reserve and reserve.liquidation_threshold:
+        return (reserve.liquidation_threshold, 'reserve')
+    
+    # Fallback to static mapping
+    if token_symbol in FALLBACK_LIQUIDATION_THRESHOLDS:
+        return (FALLBACK_LIQUIDATION_THRESHOLDS[token_symbol], 'fallback')
+    
+    # Default
+    logger.warning(f"No LT found for {token_symbol} on {chain}, using default 0.75")
+    return (FALLBACK_LIQUIDATION_THRESHOLDS['DEFAULT'], 'default')
+
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -240,36 +291,83 @@ async def get_rpc_reserve_summary(db: Session = Depends(get_db)):
 
 # ==================== POSITION ENDPOINTS ====================
 
+# Fix 2: Positions endpoint - Group by borrower and add USD values
 @router.get("/positions")
 async def get_positions(
     limit: Optional[int] = 100,
     risk_category: Optional[str] = None,
+    group_by_borrower: bool = False,
     db: Session = Depends(get_db)
 ):
-    """Get all positions with optional filtering"""
+    """Get all positions with optional grouping by borrower"""
     try:
         query = db.query(Position)
         
         if risk_category:
             query = query.filter(Position.risk_category == risk_category)
         
-        positions = query.limit(limit).all()
+        positions = query.limit(limit * 2).all()  # Get more to account for grouping
         
-        return [
-            {
-                "borrower_address": p.borrower_address,
-                "chain": p.chain,
-                "token_symbol": p.token_symbol,
-                "collateral_amount": p.collateral_amount,
-                "debt_amount": p.debt_amount,
-                "enhanced_health_factor": p.enhanced_health_factor,
-                "risk_category": p.risk_category,
-                "last_updated": p.last_updated
-            }
-            for p in positions
-        ]
+        # In api.py, update the positions endpoint grouping section:
+
+        if group_by_borrower:
+            from collections import defaultdict
+            borrower_groups = defaultdict(list)
+            
+            for p in positions:
+                key = f"{p.borrower_address}_{p.chain}"
+                borrower_groups[key].append(p)
+            
+            result = []
+            for key, pos_list in list(borrower_groups.items())[:limit]:
+                total_collateral = sum(p.total_collateral_usd or 0 for p in pos_list)
+                total_debt = sum(p.total_debt_usd or 0 for p in pos_list)
+                
+                # Calculate health factor
+                if total_debt > 0:
+                    # Has debt - use actual HF
+                    valid_hfs = [p.enhanced_health_factor for p in pos_list if p.enhanced_health_factor]
+                    min_hf = min(valid_hfs) if valid_hfs else None
+                    risk_cat = next((p.risk_category for p in pos_list if p.enhanced_health_factor == min_hf), None)
+                else:
+                    # No debt - collateral only position
+                    min_hf = float('inf')  # Infinite HF (no liquidation risk)
+                    risk_cat = "SAFE"
+                
+                result.append({
+                    "borrower_address": pos_list[0].borrower_address,
+                    "chain": pos_list[0].chain,
+                    "position_count": len(pos_list),
+                    "tokens": [p.token_symbol for p in pos_list],
+                    "total_collateral_usd": round(total_collateral, 2),
+                    "total_debt_usd": round(total_debt, 2),
+                    "lowest_health_factor": round(min_hf, 4) if min_hf != float('inf') else "∞",
+                    "risk_category": risk_cat,
+                    "position_type": "collateral_only" if total_debt == 0 else "active_borrowing",
+                    "last_updated": max(p.last_updated for p in pos_list if p.last_updated)
+                })
+            
+            return result
+        else:
+            # Return individual positions with USD values
+            return [
+                {
+                    "borrower_address": p.borrower_address,
+                    "chain": p.chain,
+                    "token_symbol": p.token_symbol,
+                    "collateral_amount": p.collateral_amount,
+                    "debt_amount": p.debt_amount,
+                    "collateral_usd": round(p.total_collateral_usd or 0, 2),
+                    "debt_usd": round(p.total_debt_usd or 0, 2),
+                    "enhanced_health_factor": p.enhanced_health_factor,
+                    "risk_category": p.risk_category,
+                    "last_updated": p.last_updated
+                }
+                for p in positions[:limit]
+            ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
+
 
 @router.get("/positions/risky")
 async def get_risky_positions(
@@ -327,13 +425,15 @@ async def get_positions_summary(db: Session = Depends(get_db)):
 
 # ==================== LIQUIDATION HISTORY ====================
 
+# Fix Liquidation history - Add USD values to response
+
 @router.get("/liquidation-history")
 async def get_liquidation_history(
     limit: Optional[int] = 100,
     chain: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Get liquidation history"""
+    """Get liquidation history with USD values"""
     try:
         query = db.query(LiquidationHistory)
         
@@ -349,100 +449,124 @@ async def get_liquidation_history(
                 "id": liq.id,
                 "liquidation_date": liq.liquidation_date,
                 "chain": liq.chain,
-                "borrower": liq.borrower,
                 "collateral_symbol": liq.collateral_symbol,
                 "debt_symbol": liq.debt_symbol,
-                "total_collateral_seized": liq.total_collateral_seized,
-                "total_debt_normalized": liq.total_debt_normalized
+                "total_collateral_seized": round(liq.total_collateral_seized or 0, 6),
+                "total_debt_normalized": round(liq.total_debt_normalized or 0, 6),
+                "collateral_seized_usd": round(liq.liquidated_collateral_usd or 0, 2),
+                "debt_repaid_usd": round(liq.liquidated_debt_usd or 0, 2)  # Changed from total_debt_usd
             }
             for liq in liquidations
         ]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch liquidation history: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+            
 # ==================== DASHBOARD ====================
 
-@router.get("/dashboard/summary")
-async def get_dashboard_summary(db: Session = Depends(get_db)):
-    """Get comprehensive dashboard summary"""
+@router.get("/protocol_risk_summary")
+async def get_protocol_risk_summary(
+    chains: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Comprehensive protocol-level risk metrics with LT source tracking
+    """
     try:
-        total_positions = db.query(Position).count()
+        chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
         
-        risk_stats = db.query(
-            Position.risk_category,
-            func.count(Position.id).label('count'),
-            func.sum(Position.total_collateral_usd).label('total_collateral'),
-            func.sum(Position.total_debt_usd).label('total_debt')
-        ).group_by(Position.risk_category).all()
+        position_query = db.query(Position)
+        if chain_filter:
+            position_query = position_query.filter(Position.chain.in_(chain_filter))
+        positions = position_query.all()
         
-        risk_distribution = {}
-        total_collateral = 0
-        total_debt = 0
-        
-        for stat in risk_stats:
-            risk_distribution[stat.risk_category or 'UNKNOWN'] = {
-                'count': stat.count,
-                'total_collateral': float(stat.total_collateral or 0),
-                'total_debt': float(stat.total_debt or 0)
+        if not positions:
+            return {
+                "total_collateral_usd": 0,
+                "total_debt_usd": 0,
+                "average_health_factor": 0,
+                "at_risk_value_usd": 0,
+                "chains_analyzed": chain_filter or [],
+                "lt_coverage": {"reserve": 0, "fallback": 0, "default": 0}
             }
-            total_collateral += float(stat.total_collateral or 0)
-            total_debt += float(stat.total_debt or 0)
         
-        protocol_ltv = total_debt / total_collateral if total_collateral > 0 else 0
+        # Track LT sources
+        lt_sources = {"reserve": 0, "fallback": 0, "default": 0}
         
-        recent_liquidations = db.query(LiquidationHistory).order_by(
-            LiquidationHistory.liquidation_date.desc()
-        ).limit(5).all()
+        for pos in positions:
+            _, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
+            lt_sources[lt_source] += 1
+        
+        total_collateral = sum(p.total_collateral_usd or 0 for p in positions)
+        total_debt = sum(p.total_debt_usd or 0 for p in positions)
+        
+        valid_hfs = [p.enhanced_health_factor for p in positions 
+                     if p.enhanced_health_factor and p.enhanced_health_factor < 100]
+        avg_hf = sum(valid_hfs) / len(valid_hfs) if valid_hfs else 0
+        
+        at_risk = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5]
+        at_risk_value = sum(p.total_collateral_usd or 0 for p in at_risk)
         
         return {
-            "protocol_overview": {
-                "total_positions": total_positions,
-                "total_collateral_usd": total_collateral,
-                "total_debt_usd": total_debt,
-                "protocol_ltv": protocol_ltv
+            "total_collateral_usd": round(total_collateral, 2),
+            "total_debt_usd": round(total_debt, 2),
+            "protocol_ltv": round(total_debt / total_collateral, 4) if total_collateral > 0 else 0,
+            "average_health_factor": round(avg_hf, 3),
+            "at_risk_value_usd": round(at_risk_value, 2),
+            "at_risk_percentage": round((at_risk_value / total_collateral * 100) if total_collateral > 0 else 0, 2),
+            "chains_analyzed": chain_filter or list(set(p.chain for p in positions if p.chain)),
+            "lt_coverage": {
+                "from_reserve_data": lt_sources['reserve'],
+                "from_fallback": lt_sources['fallback'],
+                "from_default": lt_sources['default'],
+                "reserve_coverage_pct": round((lt_sources['reserve'] / len(positions) * 100), 2)
             },
-            "risk_distribution": risk_distribution,
-            "recent_liquidations": [
-                {
-                    "date": liq.liquidation_date,
-                    "collateral_seized": liq.total_collateral_seized,
-                    "collateral_symbol": liq.collateral_symbol
-                }
-                for liq in recent_liquidations
-            ],
             "timestamp": datetime.now(timezone.utc)
         }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate dashboard: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+    
 # ==================== CHAIN MANAGEMENT ====================    
 
 @router.get("/chains/available")
 async def get_available_chains(db: Session = Depends(get_db)):
-    """Get list of chains with reserve data"""
+    """Get chains from both reserves and positions"""
     try:
-        chains = db.query(Reserve.chain).distinct().all()
-        chain_list = [c[0] for c in chains if c[0]]
+        # Get chains from reserves
+        reserve_chains = set(c[0] for c in db.query(Reserve.chain).distinct().all() if c[0])
         
-        # Get count and latest update per chain
-        chain_details = []
-        for chain in chain_list:
-            count = db.query(Reserve).filter(Reserve.chain == chain).count()
-            latest = db.query(func.max(Reserve.query_time)).filter(Reserve.chain == chain).scalar()
+        # Get chains from positions  
+        position_chains = set(c[0] for c in db.query(Position.chain).distinct().all() if c[0])
+        
+        # Combined unique chains
+        all_chains = sorted(reserve_chains | position_chains)
+        
+        details = []
+        for chain in all_chains:
+            reserve_count = db.query(Reserve).filter(Reserve.chain == chain).count()
+            position_count = db.query(Position).filter(Position.chain == chain).count()
             
-            chain_details.append({
+            reserve_latest = db.query(func.max(Reserve.query_time)).filter(Reserve.chain == chain).scalar()
+            
+            details.append({
                 "chain": chain,
-                "reserve_count": count,
-                "last_updated": latest
+                "reserve_count": reserve_count,
+                "position_count": position_count,
+                "has_reserves": reserve_count > 0,
+                "has_positions": position_count > 0,
+                "last_reserve_update": reserve_latest
             })
         
         return {
-            "chains": sorted(chain_list),
-            "details": chain_details
+            "chains": all_chains,
+            "count": len(all_chains),
+            "reserve_chains": sorted(reserve_chains),
+            "position_chains": sorted(position_chains),
+            "details": details
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # ==================== DEEP INSIGHTS ENDPOINT ====================
 
 @router.get("/insights/protocol-health")
@@ -771,24 +895,15 @@ async def get_protocol_risk_summary(
     db: Session = Depends(get_db)
 ):
     """
-    Comprehensive protocol-level risk metrics
-    Returns: Total collateral, debt, avg HF, at-risk value, utilization, highest risk chain
+    Comprehensive protocol-level risk metrics with LT source tracking
     """
     try:
-        # Parse chains
         chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
         
-        # Get positions
         position_query = db.query(Position)
         if chain_filter:
             position_query = position_query.filter(Position.chain.in_(chain_filter))
         positions = position_query.all()
-        
-        # Get reserves
-        reserve_query = db.query(Reserve).filter(Reserve.is_active == True)
-        if chain_filter:
-            reserve_query = reserve_query.filter(Reserve.chain.in_(chain_filter))
-        reserves = reserve_query.all()
         
         if not positions:
             return {
@@ -796,42 +911,26 @@ async def get_protocol_risk_summary(
                 "total_debt_usd": 0,
                 "average_health_factor": 0,
                 "at_risk_value_usd": 0,
-                "average_utilization_rate": 0,
-                "highest_risk_chain": None,
-                "chains_analyzed": chain_filter or []
+                "chains_analyzed": chain_filter or [],
+                "lt_coverage": {"reserve": 0, "fallback": 0, "default": 0}
             }
         
-        # Calculate metrics
+        # Track LT sources
+        lt_sources = {"reserve": 0, "fallback": 0, "default": 0}
+        
+        for pos in positions:
+            _, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
+            lt_sources[lt_source] += 1
+        
         total_collateral = sum(p.total_collateral_usd or 0 for p in positions)
         total_debt = sum(p.total_debt_usd or 0 for p in positions)
         
-        # Average HF (exclude infinite values)
         valid_hfs = [p.enhanced_health_factor for p in positions 
                      if p.enhanced_health_factor and p.enhanced_health_factor < 100]
         avg_hf = sum(valid_hfs) / len(valid_hfs) if valid_hfs else 0
         
-        # At-risk value (HF < 1.5)
         at_risk = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5]
         at_risk_value = sum(p.total_collateral_usd or 0 for p in at_risk)
-        
-        # Average utilization rate from reserves
-        utilization_rates = []
-        for r in reserves:
-            if r.liquidity_rate and r.variable_borrow_rate:
-                util = r.variable_borrow_rate / (r.liquidity_rate + r.variable_borrow_rate)
-                utilization_rates.append(util)
-        avg_utilization = sum(utilization_rates) / len(utilization_rates) if utilization_rates else 0
-        
-        # Highest risk chain (lowest avg HF)
-        chain_risk = {}
-        for chain in set(p.chain for p in positions if p.chain):
-            chain_positions = [p for p in positions if p.chain == chain]
-            chain_hfs = [p.enhanced_health_factor for p in chain_positions 
-                        if p.enhanced_health_factor and p.enhanced_health_factor < 100]
-            if chain_hfs:
-                chain_risk[chain] = sum(chain_hfs) / len(chain_hfs)
-        
-        highest_risk_chain = min(chain_risk.items(), key=lambda x: x[1]) if chain_risk else (None, 0)
         
         return {
             "total_collateral_usd": round(total_collateral, 2),
@@ -840,18 +939,19 @@ async def get_protocol_risk_summary(
             "average_health_factor": round(avg_hf, 3),
             "at_risk_value_usd": round(at_risk_value, 2),
             "at_risk_percentage": round((at_risk_value / total_collateral * 100) if total_collateral > 0 else 0, 2),
-            "average_utilization_rate": round(avg_utilization, 4),
-            "highest_risk_chain": {
-                "chain": highest_risk_chain[0],
-                "avg_health_factor": round(highest_risk_chain[1], 3)
+            "chains_analyzed": chain_filter or list(set(p.chain for p in positions if p.chain)),
+            "lt_coverage": {
+                "from_reserve_data": lt_sources['reserve'],
+                "from_fallback": lt_sources['fallback'],
+                "from_default": lt_sources['default'],
+                "reserve_coverage_pct": round((lt_sources['reserve'] / len(positions) * 100), 2)
             },
-            "chains_analyzed": chain_filter or list(chain_risk.keys()),
             "timestamp": datetime.now(timezone.utc)
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-
+    
 
 # ==================== BORROWER RISK SIGNALS ====================
 
@@ -863,7 +963,7 @@ async def get_borrower_risk_signals(
 ):
     """
     Identify borrowers trending toward liquidation
-    Returns: HF, HF change (if available), LTV, collateral concentration, debt composition
+    Now with proper liquidation_threshold from Reserve JOIN + fallback
     """
     try:
         # Get risky positions
@@ -875,7 +975,10 @@ async def get_borrower_risk_signals(
         signals = []
         
         for pos in positions:
-            # Calculate metrics
+            # Get liquidation threshold with fallback
+            lt, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
+            
+            # Calculate current LTV
             current_ltv = (pos.total_debt_usd / pos.total_collateral_usd) if pos.total_collateral_usd else 0
             
             # Determine urgency
@@ -893,7 +996,8 @@ async def get_borrower_risk_signals(
                 "chain": pos.chain,
                 "current_health_factor": round(pos.enhanced_health_factor, 3) if pos.enhanced_health_factor else 0,
                 "borrower_ltv": round(current_ltv, 4),
-                "liquidation_threshold": pos.liquidation_threshold,
+                "liquidation_threshold": lt,
+                "lt_source": lt_source,  # Shows if from reserve/fallback/default
                 "collateral_usd": round(pos.total_collateral_usd or 0, 2),
                 "debt_usd": round(pos.total_debt_usd or 0, 2),
                 "primary_collateral": pos.token_symbol,
@@ -973,15 +1077,35 @@ async def get_reserve_risk_metrics(
             top_borrowers = sorted(asset_positions, key=lambda x: x.total_collateral_usd or 0, reverse=True)[:3]
             
             # Risk score (higher = more risky)
+
+            # In reserve_risk_metrics endpoint, replace risk score calculation:
+
             risk_score = 0
+
+            # Frozen reserves (but check if there's actual activity)
+            if reserve.is_frozen:
+                if total_exposure > 0 or len(asset_positions) > 0:
+                    risk_score += 25  # Only add if frozen WITH exposure
+                else:
+                    risk_score += 10  # Lower score if frozen but no exposure
+
+            # High LTV
             if reserve.ltv and reserve.ltv > 0.75:
                 risk_score += 30
+
+            # High utilization
             if utilization > 0.80:
                 risk_score += 25
+
+            # Low liquidation threshold
             if reserve.liquidation_threshold and reserve.liquidation_threshold < 0.75:
                 risk_score += 20
-            if reserve.is_frozen:
-                risk_score += 25
+
+            # Large single borrower concentration (>50% of total exposure)
+            if total_exposure > 0 and top_borrowers:
+                concentration = (top_borrowers[0].total_collateral_usd or 0) / total_exposure
+                if concentration > 0.5:
+                    risk_score += 15
             
             metrics.append({
                 "token_symbol": reserve.token_symbol,
@@ -1030,13 +1154,14 @@ async def get_liquidation_trends(
     """
     try:
         from datetime import timedelta
+        from collections import Counter
         
         chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
         
-        now = datetime.now(timezone.utc)
-        cutoff_7d = now - timedelta(days=7)
+        now = datetime.now()
+        cutoff_7d = now - timedelta(days=days)
         cutoff_24h = now - timedelta(days=1)
-        
+
         # Get liquidations
         liq_query = db.query(LiquidationHistory).filter(
             LiquidationHistory.liquidation_date >= cutoff_7d
@@ -1047,51 +1172,64 @@ async def get_liquidation_trends(
         liquidations_7d = liq_query.all()
         liquidations_24h = [l for l in liquidations_7d if l.liquidation_date >= cutoff_24h]
         
-        # Calculate metrics
+        # Calculate metrics with safe division
         total_volume_7d = sum(l.liquidated_collateral_usd or 0 for l in liquidations_7d)
         total_volume_24h = sum(l.liquidated_collateral_usd or 0 for l in liquidations_24h)
         
         # Top liquidated assets
-        from collections import Counter
         asset_counter = Counter(l.collateral_symbol for l in liquidations_7d if l.collateral_symbol)
         top_assets = [
             {"asset": asset, "count": count}
             for asset, count in asset_counter.most_common(10)
         ]
         
-        # Average HF before liquidation
-        hfs_before = [l.health_factor_before for l in liquidations_7d if l.health_factor_before and l.health_factor_before < 10]
-        avg_hf_before = sum(hfs_before) / len(hfs_before) if hfs_before else 0
+        # Average HF before liquidation - FIXED: Safe None handling
+        hfs_before = [l.health_factor_before for l in liquidations_7d 
+                     if l.health_factor_before and l.health_factor_before < 1000]  # Reasonable upper bound
+        avg_hf_before = sum(hfs_before) / len(hfs_before) if hfs_before else None
         
-        # Chain distribution
+        # Chain distribution with safe division
         chain_counter = Counter(l.chain for l in liquidations_7d if l.chain)
         chain_distribution = [
-            {"chain": chain, "count": count, "percentage": round(count / len(liquidations_7d) * 100, 2)}
+            {
+                "chain": chain, 
+                "count": count, 
+                "percentage": round(count / len(liquidations_7d) * 100, 2) if liquidations_7d else 0
+            }
             for chain, count in chain_counter.most_common()
         ]
         
         # Trend analysis (compare 24h vs 7d average)
-        daily_avg_7d = len(liquidations_7d) / 7
-        trend = "INCREASING" if len(liquidations_24h) > daily_avg_7d * 1.2 else "DECREASING" if len(liquidations_24h) < daily_avg_7d * 0.8 else "STABLE"
+        daily_avg_7d = len(liquidations_7d) / days if liquidations_7d else 0
+        trend = "STABLE"
+        if liquidations_24h:
+            if len(liquidations_24h) > daily_avg_7d * 1.2:
+                trend = "INCREASING"
+            elif len(liquidations_24h) < daily_avg_7d * 0.8:
+                trend = "DECREASING"
         
-        return {
+        result = {
             "period_days": days,
             "liquidations_24h": len(liquidations_24h),
             "liquidations_7d": len(liquidations_7d),
             "liquidation_volume_usd_24h": round(total_volume_24h, 2),
             "liquidation_volume_usd_7d": round(total_volume_7d, 2),
             "top_liquidated_assets": top_assets,
-            "average_health_factor_before": round(avg_hf_before, 3),
             "chain_distribution": chain_distribution,
             "trend": trend,
             "daily_average_7d": round(daily_avg_7d, 2),
             "timestamp": datetime.now(timezone.utc)
         }
         
+        # Only add average HF if we have valid data
+        if avg_hf_before is not None:
+            result["average_health_factor_before"] = round(avg_hf_before, 3)
+        
+        return result
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-
-
+    
 # ==================== CROSS-CHAIN RISK COMPARISON ====================
 
 @router.get("/crosschain_risk_comparison")
@@ -1185,18 +1323,17 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
 
 @router.get("/risk_alerts_feed")
 async def get_risk_alerts_feed(
-    severity: Optional[str] = None,  # CRITICAL, HIGH, MEDIUM, LOW
+    severity: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db)
 ):
     """
-    Real-time risk alert feed for notification service/dashboard
-    Triggers: HF < 1.05 (Critical), LTV > 90% of LT, Utilization > 95%
+    Real-time risk alert feed with proper LT handling
     """
     try:
         alerts = []
         
-        # 1. Critical Health Factor Alerts
+        # 1. Critical Health Factor Alerts (unchanged)
         critical_positions = db.query(Position).filter(
             Position.enhanced_health_factor < 1.05,
             Position.enhanced_health_factor > 0
@@ -1217,15 +1354,18 @@ async def get_risk_alerts_feed(
                 "timestamp": datetime.now(timezone.utc)
             })
         
-        # 2. Near Margin Call Alerts (LTV > 90% of LT)
+        # 2. Near Margin Call Alerts (UPDATED with LT lookup)
         positions = db.query(Position).filter(
             Position.total_debt_usd > 0,
-            Position.liquidation_threshold > 0
+            Position.total_collateral_usd > 0
         ).all()
         
         for pos in positions:
+            # Get liquidation threshold with fallback
+            lt, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
+            
             current_ltv = (pos.total_debt_usd / pos.total_collateral_usd) if pos.total_collateral_usd else 0
-            ltv_threshold = (pos.liquidation_threshold or 0.85) * 0.9
+            ltv_threshold = lt * 0.9  # 90% of liquidation threshold
             
             if current_ltv > ltv_threshold:
                 alerts.append({
@@ -1237,12 +1377,13 @@ async def get_risk_alerts_feed(
                     "chain": pos.chain,
                     "token": pos.token_symbol,
                     "current_ltv": round(current_ltv, 4),
-                    "liquidation_threshold": pos.liquidation_threshold,
+                    "liquidation_threshold": lt,
+                    "lt_source": lt_source,
                     "action_required": "Add collateral or repay debt",
                     "timestamp": datetime.now(timezone.utc)
                 })
         
-        # 3. Liquidity Squeeze Alerts (Utilization > 95%)
+        # 3. Liquidity Squeeze Alerts (unchanged)
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
@@ -1297,8 +1438,7 @@ async def get_risk_alerts_feed(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-
-
+    
 # ==================== AVAILABLE CHAINS ENDPOINT ====================
 
 @router.get("/chains/available")
@@ -1316,7 +1456,7 @@ async def get_available_chains(db: Session = Depends(get_db)):
             chain_details.append({
                 "chain": chain,
                 "reserve_count": count,
-                "last_updated": latest
+                "last_updated": latest 
             })
         
         return {

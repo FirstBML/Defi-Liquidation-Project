@@ -1,6 +1,8 @@
+# rpc_reserve_fetcher.py
+
 """
 RPC-based Aave V3 Reserve Data Fetcher
-Replaces Dune reserve data with direct blockchain calls
+Now supports 8 chains: Ethereum, Polygon, Arbitrum, Optimism, Avalanche, BNB, Base, Fantom
 """
 from web3 import Web3
 import pandas as pd
@@ -13,12 +15,23 @@ logger = logging.getLogger(__name__)
 class AaveRPCReserveFetcher:
     """Fetch Aave V3 reserve data directly from blockchain RPCs"""
     
+    # Primary RPC endpoints (with fallbacks for new chains)
     RPC_ENDPOINTS = {
         'ethereum': 'https://eth.llamarpc.com',
         'polygon': 'https://polygon-rpc.com',
         'arbitrum': 'https://arb1.arbitrum.io/rpc',
         'optimism': 'https://mainnet.optimism.io',
-        'avalanche': 'https://api.avax.network/ext/bc/C/rpc'
+        'avalanche': 'https://api.avax.network/ext/bc/C/rpc',
+        'bnb': 'https://bsc-dataseed.binance.org',
+        'base': 'https://mainnet.base.org',
+        'fantom': 'https://fantom-mainnet.public.blastapi.io'
+    }
+    
+    # Fallback RPCs for reliability
+    FALLBACK_RPCS = {
+        'bnb': ['https://bsc-dataseed1.defibit.io', 'https://bsc-dataseed1.ninicoin.io'],
+        'base': ['https://base-rpc.publicnode.com', 'https://rpc.ankr.com/base'],
+        'fantom': ['https://fantom.publicnode.com', 'https://rpc.fantom.network']
     }
     
     POOL_ADDRESSES = {
@@ -26,7 +39,10 @@ class AaveRPCReserveFetcher:
         'polygon': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
         'arbitrum': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
         'optimism': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-        'avalanche': '0x794a61358D6845594F94dc1DB02A252b5b4814aD'
+        'avalanche': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'bnb': '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+        'base': '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+        'fantom': '0x794a61358D6845594F94dc1DB02A252b5b4814aD'
     }
     
     POOL_ABI = [
@@ -74,39 +90,47 @@ class AaveRPCReserveFetcher:
         self.connection_cache = {}
     
     def _get_web3_connection(self, chain: str) -> Optional[Web3]:
-        """Get or create Web3 connection for chain"""
+        """Get or create Web3 connection with fallback support"""
         if chain in self.connection_cache:
             w3 = self.connection_cache[chain]
             if w3.is_connected():
                 return w3
         
-        try:
-            w3 = Web3(Web3.HTTPProvider(self.RPC_ENDPOINTS[chain], request_kwargs={'timeout': 30}))
-            if w3.is_connected():
-                self.connection_cache[chain] = w3
-                logger.info(f"Connected to {chain} at block {w3.eth.block_number}")
-                return w3
-        except Exception as e:
-            logger.error(f"Failed to connect to {chain}: {e}")
+        # Try primary endpoint
+        endpoints = [self.RPC_ENDPOINTS[chain]]
         
+        # Add fallbacks if available
+        if chain in self.FALLBACK_RPCS:
+            endpoints.extend(self.FALLBACK_RPCS[chain])
+        
+        for endpoint in endpoints:
+            try:
+                w3 = Web3(Web3.HTTPProvider(endpoint, request_kwargs={'timeout': 60}))
+                if w3.is_connected():
+                    block_number = w3.eth.block_number
+                    self.connection_cache[chain] = w3
+                    logger.info(f"Connected to {chain} at block {block_number}")
+                    return w3
+            except Exception as e:
+                logger.warning(f"Failed {endpoint}: {str(e)[:80]}")
+                continue
+        
+        logger.error(f"All RPC endpoints failed for {chain}")
         return None
     
-    
     def _get_token_info(self, w3: Web3, address: str) -> Dict[str, any]:
-        """Get token symbol, decimals, and name"""
+        """Get token symbol, decimals, and name (handles bytes32 tokens)"""
         try:
             token_contract = w3.eth.contract(
                 address=Web3.to_checksum_address(address),
                 abi=self.ERC20_ABI
             )
             
-            # Try normal string call first
             try:
                 symbol = token_contract.functions.symbol().call()
             except:
-                # Some tokens (like MKR) return bytes32 instead of string
-                # Try to decode as bytes
-                symbol_bytes = w3.eth.call({'to': address, 'data': '0x95d89b41'})  # symbol() selector
+                # Handle bytes32 tokens like MKR
+                symbol_bytes = w3.eth.call({'to': address, 'data': '0x95d89b41'})
                 symbol = symbol_bytes.decode('utf-8').rstrip('\x00') if symbol_bytes else 'UNKNOWN'
             
             return {
@@ -117,7 +141,6 @@ class AaveRPCReserveFetcher:
         except Exception as e:
             logger.warning(f"Failed to get token info for {address}: {str(e)[:100]}")
             return {'symbol': 'UNKNOWN', 'decimals': 18, 'name': 'Unknown'}
-        
     
     def _decode_configuration(self, configuration: int) -> Dict[str, any]:
         """Decode Aave V3 reserve configuration bitmask"""
@@ -134,7 +157,7 @@ class AaveRPCReserveFetcher:
     def fetch_chain_reserves(self, chain: str) -> pd.DataFrame:
         """Fetch all reserves for a specific chain"""
         if chain not in self.RPC_ENDPOINTS:
-            logger.error(f"Chain {chain} not supported")
+            logger.error(f"Chain {chain} not supported. Supported: {list(self.RPC_ENDPOINTS.keys())}")
             return pd.DataFrame()
         
         w3 = self._get_web3_connection(chain)
@@ -165,36 +188,22 @@ class AaveRPCReserveFetcher:
                         'token_symbol': token_info['symbol'],
                         'token_name': token_info['name'],
                         'decimals': token_info['decimals'],
-                        
-                        # Interest rates (converted from ray to decimal)
                         'liquidity_rate': reserve_data[3] / 1e27,
                         'variable_borrow_rate': reserve_data[4] / 1e27,
                         'stable_borrow_rate': reserve_data[5] / 1e27,
-                        
-                        # Risk parameters
                         'ltv': config['ltv'],
                         'liquidation_threshold': config['liquidation_threshold'],
                         'liquidation_bonus': config['liquidation_bonus'],
-                        
-                        # Status flags
                         'is_active': config['is_active'],
                         'is_frozen': config['is_frozen'],
                         'borrowing_enabled': config['borrowing_enabled'],
                         'stable_borrowing_enabled': config['stable_borrowing_enabled'],
-                        
-                        # Indices
                         'liquidity_index': reserve_data[1] / 1e27,
                         'variable_borrow_index': reserve_data[2] / 1e27,
-                        
-                        # Contract addresses
                         'atoken_address': reserve_data[8].lower(),
                         'variable_debt_token_address': reserve_data[10].lower(),
-                        
-                        # Timestamps
                         'last_update_timestamp': reserve_data[6],
                         'query_time': query_time,
-                        
-                        # Calculated metrics
                         'supply_apy': (reserve_data[3] / 1e27) * 100,
                         'borrow_apy': (reserve_data[4] / 1e27) * 100,
                     }
@@ -236,8 +245,6 @@ class AaveRPCReserveFetcher:
         
         return all_data
     
-    # In rpc_reserve_fetcher.py, update _enrich_with_prices method:
-
     def _enrich_with_prices(self, df: pd.DataFrame, chain: str) -> pd.DataFrame:
         """Enrich reserve data with current USD prices"""
         df['price_usd'] = 0.0
