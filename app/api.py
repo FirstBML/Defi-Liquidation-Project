@@ -548,13 +548,16 @@ async def get_available_chains(db: Session = Depends(get_db)):
             
             reserve_latest = db.query(func.max(Reserve.query_time)).filter(Reserve.chain == chain).scalar()
             
+            # FIX: Display "NA on reserve" instead of null
+            last_reserve_display = reserve_latest if reserve_latest else "NA on reserve"
+            
             details.append({
                 "chain": chain,
                 "reserve_count": reserve_count,
                 "position_count": position_count,
                 "has_reserves": reserve_count > 0,
                 "has_positions": position_count > 0,
-                "last_reserve_update": reserve_latest
+                "last_reserve_update": last_reserve_display  # Changed from reserve_latest
             })
         
         return {
@@ -566,7 +569,7 @@ async def get_available_chains(db: Session = Depends(get_db)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+        
 # ==================== DEEP INSIGHTS ENDPOINT ====================
 
 @router.get("/insights/protocol-health")

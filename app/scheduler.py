@@ -336,9 +336,9 @@ def start_scheduler():
     scheduler.add_job(
         lambda: refresh_prices_only(SessionLocal(), EnhancedPriceFetcher(api_key=settings.COINGECKO_API_KEY)),
         "interval",
-        minutes=720,
+        minutes=1440,
         id="price_refresh_job"
     )
     
     scheduler.start()
-    logger.info("Scheduler started: RPC (24h), Prices (6h)")
+    logger.info("Scheduler started: RPC (24h), Prices (24h)")
