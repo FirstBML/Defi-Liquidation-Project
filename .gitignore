@@ -1,0 +1,60 @@
+# Ignore virtual environment (Created by venv; see https://docs.python.org/3/library/venv.html)
+venv/
+
+# Ignore Python cache and bytecode files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+build/
+dist/
+*.egg-info/
+
+# Ignore Jupyter Notebook files and checkpoints
+*.ipynb
+.ipynb_checkpoints/
+
+# Ignore generated data files (databases, caches, CSVs, JSON outputs)
+*.db
+*.db.backup*
+*.csv
+price_cache.json
+risk_cache/
+# Note: risk_cache/ is already partially covered, but this ensures the root one too
+
+# Ignore environment and config files with secrets
+.env
+.env.local
+*.env.*
+
+# Ignore directories/folders (legacy, tests, caches)
+Test&Fixing/
+DefiLiquidation/
+risk_cache/  # Covers both root and app/risk_cache/
+
+# Ignore IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Ignore logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+# Ignore all Jupyter notebooks and CSV files inside app folder (redundant but explicit if needed)
+app/**/*.ipynb
+app/**/*.csv
