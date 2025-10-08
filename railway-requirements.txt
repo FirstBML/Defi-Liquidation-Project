@@ -1,19 +1,18 @@
-# Railway deployment requirements - Compatible versions
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
-redis==5.0.1
-apscheduler==3.10.4
+# Railway deployment requirements - Railway handles PostgreSQL
+fastapi==0.100.0
+uvicorn[standard]==0.23.2
+sqlalchemy==2.0.20
+redis==5.0.0
+apscheduler==3.10.1
 
-# Data processing - COMPATIBLE versions
-pandas==2.0.3
+# Data processing
+pandas==1.5.3
 numpy==1.24.3
 
 # Blockchain
-web3==6.11.0
-aiohttp==3.9.1
-pydantic==2.5.0
+web3==6.5.0
+aiohttp==3.8.5
+pydantic==1.10.12
 python-dotenv==1.0.0
-alembic==1.12.1
-requests==2.31.0
+alembic==1.12.0
+requests==2.30.0
