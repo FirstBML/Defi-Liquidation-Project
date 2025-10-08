@@ -222,5 +222,3 @@ async def test_redis_cloud():
         }
         
 
-# Legacy startup event as backup
-# In your lifespan function, add:
