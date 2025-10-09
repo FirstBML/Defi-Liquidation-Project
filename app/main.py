@@ -10,8 +10,12 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi.responses import RedirectResponse
-from app import api
 import warnings
+
+try:
+    from app import api
+except ImportError:
+    import api
 
 
 warnings.filterwarnings('ignore', module='eth_utils')
