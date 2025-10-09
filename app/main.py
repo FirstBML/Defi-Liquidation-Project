@@ -151,7 +151,8 @@ def startup_status():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    logger.info(f"Starting server on port {port}")
+    logger.info(f"🔌 PORT environment variable: {os.getenv('PORT', 'not set')}")
+    logger.info(f"🚀 Starting server on port {port}")
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
