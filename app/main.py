@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from fastapi.responses import RedirectResponse
 
 # Load environment variables FIRST
 load_dotenv()
@@ -65,10 +66,12 @@ app.add_middleware(
 # ------------------------------------------------------
 # 🔹 Root & Health Endpoints
 # ------------------------------------------------------
-@app.get("/")
-def root():
-    return {"message": "DeFi Risk Early-Warning System API is running 🚀"}
 
+# Replace your root endpoint with this:
+@app.get("/", include_in_schema=False)
+async def root():
+    """Redirect root to API documentation"""
+    return RedirectResponse(url="/docs")
 
 @app.get("/health")
 def health_check():
