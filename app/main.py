@@ -1,10 +1,10 @@
 """
-Integrated FastAPI Main Application - Zero dependency breakage
+Integrated FastAPI Main Application - Railway Ready
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
+from datetime import datetime, timezone
 import logging
 import os
 
@@ -12,6 +12,7 @@ import os
 from .api import router as api_router
 
 # Load environment variables
+from dotenv import load_dotenv
 load_dotenv()
 
 # Logging
@@ -143,7 +144,6 @@ async def root():
     }
 
 # Health check endpoint - always available
-# Health check endpoint - always available
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -151,7 +151,7 @@ async def health_check():
         "status": "healthy", 
         "version": "2.0.0",
         "api": "operational",
-        "timestamp": "2025-10-08T11:12:54Z"  # You can make this dynamic
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
     
     # Add cache health if available
@@ -163,22 +163,27 @@ async def health_check():
     else:
         health_info["cache"] = {"available": False, "info": "No cache configured"}
     
-    # Add database health if available - with SQLAlchemy 2.0 fix
-    # In your health_check function, replace the database section with:
+    # Add database health if available
     if Base and engine:
         try:
             from .db_models import SessionLocal
-            from sqlalchemy import text  # Add this import
+            from sqlalchemy import text
             
             db = SessionLocal()
-            db.execute(text("SELECT 1"))  # Wrap with text()
+            db.execute(text("SELECT 1"))
             db.close()
-            health_info["database"] = "connected"
+            health_info["database"] = {
+                "status": "connected", 
+                "type": "postgresql" if "postgresql" in str(engine.url) else "sqlite"
+            }
         except Exception as e:
-            health_info["database"] = f"error: {e}"
+            health_info["database"] = {
+                "status": "error", 
+                "error": str(e)
+            }
             health_info["status"] = "degraded"
     else:
-        health_info["database"] = "not_configured"
+        health_info["database"] = {"status": "not_configured"}
     
     return health_info
 
@@ -198,7 +203,7 @@ async def test_redis_cloud():
         r = redis.Redis.from_url(
             redis_url, 
             decode_responses=True,
-            ssl_cert_reqs=None  # Important for Redis Cloud SSL
+            ssl_cert_reqs=None
         )
         r.ping()
         
@@ -220,5 +225,3 @@ async def test_redis_cloud():
             "error": str(e),
             "your_redis_url_scheme": redis_url.split('://')[0] if '://' in redis_url else 'missing'
         }
-        
-

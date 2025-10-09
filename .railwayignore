@@ -1,0 +1,44 @@
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.Python
+
+# Virtual environment
+env/
+venv/
+DefiLiquidation/
+
+# Environment files
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# Test files
+test_*.py
+check_*.py
+fix_*.py
+backfill_*.py
+cleanup_*.py
+debug_*.py
+force_*.py
+migrate_*.py
+
+# Temporary
+*.backup_*
+*.log
+risk_cache/
+Test&Fixing/
+
+# Notebook
+*.ipynb
