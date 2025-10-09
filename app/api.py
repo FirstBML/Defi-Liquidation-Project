@@ -8,6 +8,9 @@ from sqlalchemy import func, desc
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
+import os
+import pandas as pd
+
 from .db_models import SessionLocal, Reserve, Position, LiquidationHistory, AnalysisSnapshot
 from .rpc_reserve_fetcher import AaveRPCReserveFetcher
 from .price_fetcher import EnhancedPriceFetcher
@@ -177,83 +180,282 @@ async def get_rpc_reserves(
         raise HTTPException(status_code=500, detail=f"Failed to fetch reserves: {str(e)}")
 
 
-class RefreshRequest(BaseModel):
-    chains: Optional[List[str]] = None
+# ==================== UNIFIED DATA REFRESH ENDPOINT ====================
 
-@router.post("/reserves/rpc/refresh")
-async def refresh_rpc_reserves(
-    body: Optional[RefreshRequest] = None,  # Make it optional
+
+class RefreshRequest(BaseModel):
+    """Request model for data refresh"""
+    chains: Optional[List[str]] = None
+    refresh_reserves: bool = True
+    refresh_positions: bool = True
+    refresh_liquidations: bool = True
+    prices_only: bool = False  # If True, only update prices, not full RPC fetch
+
+@router.post("/data/refresh")
+async def unified_data_refresh(
+    body: Optional[RefreshRequest] = None,
     db: Session = Depends(get_db)
 ):
     """
-    Manually trigger RPC reserve refresh
-    Body (optional): {"chains": ["ethereum", "polygon"]}
-    Empty body = refresh all chains
+    🔄 UNIFIED DATA REFRESH ENDPOINT
+    
+    Refreshes all data sources:
+    - RPC Reserve data (from blockchain)
+    - Position data (from Dune)
+    - Liquidation history (from Dune)
+    - Token prices (from CoinGecko)
+    
+    Usage:
+    - Manual: POST /api/data/refresh
+    - Full refresh: {"refresh_reserves": true, "refresh_positions": true}
+    - Prices only: {"prices_only": true}
+    - Specific chains: {"chains": ["ethereum", "polygon"]}
     """
     try:
-        settings = get_settings()
+        from .price_fetcher import EnhancedPriceFetcher
+        from .rpc_reserve_fetcher import AaveRPCReserveFetcher
+        from dune_client.client import DuneClient
         
+        settings = get_settings()
+        request = body or RefreshRequest()
+        
+        results = {
+            "timestamp": datetime.now(timezone.utc),
+            "chains": request.chains or "all",
+            "reserves": None,
+            "positions": None,
+            "liquidations": None,
+            "prices": None
+        }
+        
+        # Initialize price fetcher (needed for everything)
+        logger.info("Initializing price fetcher...")
         price_fetcher = EnhancedPriceFetcher(
             api_key=getattr(settings, 'COINGECKO_API_KEY', None)
         )
-        rpc_fetcher = AaveRPCReserveFetcher(price_fetcher=price_fetcher)
         
-        # Extract chains from body (None if empty body = all chains)
-        chains = body.chains if (body and body.chains) else None
+        # ========== 1. REFRESH RESERVES ==========
+        if request.refresh_reserves and not request.prices_only:
+            logger.info("🔄 Refreshing reserve data from RPC...")
+            try:
+                rpc_fetcher = AaveRPCReserveFetcher(price_fetcher=price_fetcher)
+                all_data = rpc_fetcher.fetch_all_chains(chains=request.chains)
+                
+                stored_count = 0
+                for chain, df in all_data.items():
+                    for _, row in df.iterrows():
+                        reserve = Reserve(
+                            chain=row['chain'],
+                            token_address=row['token_address'],
+                            token_symbol=row['token_symbol'],
+                            token_name=row['token_name'],
+                            decimals=row['decimals'],
+                            liquidity_rate=row['liquidity_rate'],
+                            variable_borrow_rate=row['variable_borrow_rate'],
+                            stable_borrow_rate=row['stable_borrow_rate'],
+                            supply_apy=row['supply_apy'],
+                            borrow_apy=row['borrow_apy'],
+                            ltv=row['ltv'],
+                            liquidation_threshold=row['liquidation_threshold'],
+                            liquidation_bonus=row['liquidation_bonus'],
+                            is_active=row['is_active'],
+                            is_frozen=row['is_frozen'],
+                            borrowing_enabled=row['borrowing_enabled'],
+                            stable_borrowing_enabled=row['stable_borrowing_enabled'],
+                            liquidity_index=row['liquidity_index'],
+                            variable_borrow_index=row['variable_borrow_index'],
+                            atoken_address=row['atoken_address'],
+                            variable_debt_token_address=row['variable_debt_token_address'],
+                            price_usd=row.get('price_usd', 0.0),
+                            price_available=row.get('price_available', False),
+                            last_update_timestamp=row['last_update_timestamp'],
+                            query_time=row['query_time']
+                        )
+                        db.add(reserve)
+                        stored_count += 1
+                
+                db.commit()
+                results["reserves"] = {
+                    "status": "success",
+                    "count": stored_count,
+                    "chains_processed": list(all_data.keys())
+                }
+                logger.info(f"✅ Stored {stored_count} reserves")
+                
+            except Exception as e:
+                logger.error(f"Reserve refresh failed: {e}")
+                results["reserves"] = {"status": "error", "error": str(e)}
         
-        logger.info(f"Refreshing chains: {chains or 'all'}")
-        all_data = rpc_fetcher.fetch_all_chains(chains=chains)
+        # ========== 2. REFRESH POSITIONS (FROM DUNE) ==========
+        if request.refresh_positions and not request.prices_only:
+            logger.info("🔄 Refreshing position data from Dune...")
+            try:
+                dune_key = os.getenv("DUNE_API_KEY_CURRENT_POSITION")
+                if dune_key:
+                    dune = DuneClient(api_key=dune_key)
+                    response = dune.get_custom_endpoint_result(
+                        "firstbml", "current-position", limit=5000
+                    )
+                    
+                    if hasattr(response, "result") and response.result:
+                        # Clear old positions
+                        db.query(Position).delete()
+                        
+                        position_count = 0
+                        for row in response.result.rows:
+                            position = Position(
+                                borrower_address=row.get('borrower_address'),
+                                chain=row.get('chain'),
+                                token_symbol=row.get('token_symbol'),
+                                token_address=row.get('token_address'),
+                                collateral_amount=row.get('collateral_amount'),
+                                debt_amount=row.get('debt_amount'),
+                                health_factor=row.get('health_factor'),
+                                total_collateral_usd=row.get('total_collateral_usd'),
+                                total_debt_usd=row.get('total_debt_usd'),
+                                enhanced_health_factor=row.get('enhanced_health_factor'),
+                                risk_category=row.get('risk_category'),
+                                last_updated=datetime.now(timezone.utc)
+                            )
+                            db.add(position)
+                            position_count += 1
+                        
+                        db.commit()
+                        results["positions"] = {
+                            "status": "success",
+                            "count": position_count
+                        }
+                        logger.info(f"✅ Stored {position_count} positions")
+                else:
+                    results["positions"] = {
+                        "status": "skipped",
+                        "reason": "DUNE_API_KEY_CURRENT_POSITION not set"
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Position refresh failed: {e}")
+                results["positions"] = {"status": "error", "error": str(e)}
         
-               
-        if not all_data:
-            raise HTTPException(status_code=500, detail="Failed to fetch any reserve data")
+        # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) ==========
+        if request.refresh_liquidations and not request.prices_only:
+            logger.info("🔄 Refreshing liquidation data from Dune...")
+            try:
+                dune_key = os.getenv("DUNE_API_KEY_LIQUIDATION_HISTORY")
+                if dune_key:
+                    dune = DuneClient(api_key=dune_key)
+                    response = dune.get_custom_endpoint_result(
+                        "firstbml", "liquidation-history", limit=5000
+                    )
+                    
+                    if hasattr(response, "result") and response.result:
+                        # Clear old liquidations
+                        db.query(LiquidationHistory).delete()
+                        
+                        liq_count = 0
+                        for row in response.result.rows:
+                            # Calculate USD value
+                            collateral_seized = row.get('total_collateral_seized', 0) or 0
+                            liquidated_usd = 0.0
+                            
+                            if collateral_seized > 0:
+                                symbol = row.get('collateral_symbol')
+                                price_data = price_fetcher.get_batch_prices([{
+                                    'symbol': symbol,
+                                    'address': row.get('collateral_token'),
+                                    'chain': row.get('chain')
+                                }])
+                                if symbol in price_data:
+                                    price = price_data[symbol].get('price', 0)
+                                    liquidated_usd = collateral_seized * price
+                            
+                            liquidation = LiquidationHistory(
+                                liquidation_date=pd.to_datetime(row.get('liquidation_date')),
+                                chain=row.get('chain'),
+                                borrower=row.get('borrower'),
+                                collateral_symbol=row.get('collateral_symbol'),
+                                debt_symbol=row.get('debt_symbol'),
+                                collateral_asset=row.get('collateral_token'),
+                                debt_asset=row.get('debt_token'),
+                                total_collateral_seized=collateral_seized,
+                                total_debt_normalized=row.get('total_debt_normalized'),
+                                liquidated_collateral_usd=liquidated_usd,
+                                liquidation_count=row.get('liquidation_count'),
+                                query_time=datetime.now(timezone.utc)
+                            )
+                            db.add(liquidation)
+                            liq_count += 1
+                        
+                        db.commit()
+                        results["liquidations"] = {
+                            "status": "success",
+                            "count": liq_count
+                        }
+                        logger.info(f"✅ Stored {liq_count} liquidations")
+                else:
+                    results["liquidations"] = {
+                        "status": "skipped",
+                        "reason": "DUNE_API_KEY_LIQUIDATION_HISTORY not set"
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Liquidation refresh failed: {e}")
+                results["liquidations"] = {"status": "error", "error": str(e)}
         
-        stored_count = 0
-        
-        for chain, df in all_data.items():
-            for _, row in df.iterrows():
-                reserve = Reserve(
-                    chain=row['chain'],
-                    token_address=row['token_address'],
-                    token_symbol=row['token_symbol'],
-                    token_name=row['token_name'],
-                    decimals=row['decimals'],
-                    liquidity_rate=row['liquidity_rate'],
-                    variable_borrow_rate=row['variable_borrow_rate'],
-                    stable_borrow_rate=row['stable_borrow_rate'],
-                    supply_apy=row['supply_apy'],
-                    borrow_apy=row['borrow_apy'],
-                    ltv=row['ltv'],
-                    liquidation_threshold=row['liquidation_threshold'],
-                    liquidation_bonus=row['liquidation_bonus'],
-                    is_active=row['is_active'],
-                    is_frozen=row['is_frozen'],
-                    borrowing_enabled=row['borrowing_enabled'],
-                    stable_borrowing_enabled=row['stable_borrowing_enabled'],
-                    liquidity_index=row['liquidity_index'],
-                    variable_borrow_index=row['variable_borrow_index'],
-                    atoken_address=row['atoken_address'],
-                    variable_debt_token_address=row['variable_debt_token_address'],
-                    price_usd=row.get('price_usd', 0.0),
-                    price_available=row.get('price_available', False),
-                    last_update_timestamp=row['last_update_timestamp'],
-                    query_time=row['query_time']
-                )
-                db.add(reserve)
-                stored_count += 1
-        
-        db.commit()
+        # ========== 4. REFRESH PRICES ONLY (FAST) ==========
+        if request.prices_only:
+            logger.info("🔄 Refreshing prices only...")
+            try:
+                reserves = db.query(Reserve).filter(Reserve.is_active == True).all()
+                
+                from collections import defaultdict
+                reserves_by_chain = defaultdict(list)
+                for r in reserves:
+                    reserves_by_chain[r.chain].append(r)
+                
+                updated_count = 0
+                for chain, chain_reserves in reserves_by_chain.items():
+                    tokens = [
+                        {'symbol': r.token_symbol, 'address': r.token_address, 'chain': chain}
+                        for r in chain_reserves
+                    ]
+                    
+                    prices = price_fetcher.get_batch_prices(tokens, progress=None)
+                    
+                    for reserve in chain_reserves:
+                        price_data = prices.get(reserve.token_symbol, {})
+                        price = price_data.get('price', 0) if isinstance(price_data, dict) else float(price_data or 0)
+                        
+                        if price > 0:
+                            reserve.price_usd = price
+                            reserve.price_available = True
+                            updated_count += 1
+                
+                db.commit()
+                results["prices"] = {
+                    "status": "success",
+                    "updated": updated_count,
+                    "total": len(reserves)
+                }
+                logger.info(f"✅ Updated {updated_count} prices")
+                
+            except Exception as e:
+                logger.error(f"Price refresh failed: {e}")
+                results["prices"] = {"status": "error", "error": str(e)}
         
         return {
-            "status": "success",
-            "chains_processed": list(all_data.keys()),
-            "reserves_stored": stored_count,
-            "timestamp": datetime.now(timezone.utc)
+            "status": "completed",
+            "results": results,
+            "summary": {
+                "reserves_updated": results["reserves"]["count"] if results["reserves"] and results["reserves"].get("status") == "success" else 0,
+                "positions_updated": results["positions"]["count"] if results["positions"] and results["positions"].get("status") == "success" else 0,
+                "liquidations_updated": results["liquidations"]["count"] if results["liquidations"] and results["liquidations"].get("status") == "success" else 0,
+                "prices_updated": results["prices"]["updated"] if results["prices"] and results["prices"].get("status") == "success" else 0
+            }
         }
         
     except Exception as e:
         db.rollback()
-        logger.error(f"Reserve refresh failed: {e}")
+        logger.error(f"Unified refresh failed: {e}")
         raise HTTPException(status_code=500, detail=f"Refresh failed: {str(e)}")
 
 @router.get("/reserves/rpc/summary")

@@ -21,11 +21,20 @@ load_dotenv()
 # ------------------------------------------------------
 # 🔹 Application Lifespan (startup/shutdown events)
 # ------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[{datetime.now(timezone.utc)}] Starting up FastAPI app...")
+    
+    # Start the scheduler
+    from app.scheduler import start_scheduler
+    start_scheduler()
+    
     yield
+    
     print(f"[{datetime.now(timezone.utc)}] Shutting down FastAPI app...")
+    from app.scheduler import scheduler
+    scheduler.shutdown()
 
 
 # ------------------------------------------------------
