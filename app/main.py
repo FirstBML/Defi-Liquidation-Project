@@ -10,6 +10,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi.responses import RedirectResponse
+from app import api
 
 # Load environment variables FIRST
 load_dotenv()
@@ -54,13 +55,10 @@ app.add_middleware(
 
 
 # ------------------------------------------------------
-# 🔹 Routers (if you have separate API route files)
+# 🔹 Include API Router
 # ------------------------------------------------------
-# Example (uncomment when routes exist)
-# from app.routes import alerts, aave, positions
-# app.include_router(alerts.router, prefix="/alerts")
-# app.include_router(aave.router, prefix="/aave")
-# app.include_router(positions.router, prefix="/positions")
+
+app.include_router(api.router, prefix="/api")
 
 
 # ------------------------------------------------------
