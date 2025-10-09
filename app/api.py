@@ -293,7 +293,7 @@ async def unified_data_refresh(
                 dune_key = os.getenv("DUNE_API_KEY_CURRENT_POSITION")
                 if dune_key:
                     dune = DuneClient(api_key=dune_key)
-                    response = dune.get_custom_endpoint_result(
+                    response = dune.get_result(
                         "firstbml", "current-position", limit=5000
                     )
                     
@@ -337,13 +337,14 @@ async def unified_data_refresh(
                 results["positions"] = {"status": "error", "error": str(e)}
         
         # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) ==========
+
         if request.refresh_liquidations and not request.prices_only:
             logger.info("🔄 Refreshing liquidation data from Dune...")
             try:
                 dune_key = os.getenv("DUNE_API_KEY_LIQUIDATION_HISTORY")
                 if dune_key:
                     dune = DuneClient(api_key=dune_key)
-                    response = dune.get_custom_endpoint_result(
+                    response = dune.get_result(
                         "firstbml", "liquidation-history", limit=5000
                     )
                     
