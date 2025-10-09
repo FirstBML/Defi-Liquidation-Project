@@ -286,46 +286,69 @@ async def unified_data_refresh(
                 logger.error(f"Reserve refresh failed: {e}")
                 results["reserves"] = {"status": "error", "error": str(e)}
         
-        # ========== 2. REFRESH POSITIONS (FROM DUNE) ==========
+       
+        # ========== 2. REFRESH POSITIONS (FROM DUNE) - CUSTOM ENDPOINT ==========
         if request.refresh_positions and not request.prices_only:
             logger.info("🔄 Refreshing position data from Dune...")
             try:
                 dune_key = os.getenv("DUNE_API_KEY_CURRENT_POSITION")
                 if dune_key:
+                    from dune_client.client import DuneClient
+                    
                     dune = DuneClient(api_key=dune_key)
+                    
+                    # ✅ CORRECT METHOD - Same as your sync_dune_data.py
+                    logger.info("Calling Dune custom endpoint: firstbml/current-position")
                     response = dune.get_custom_endpoint_result(
-                        "firstbml", "current-position", limit=5000
+                        "firstbml",           # Your Dune username
+                        "current-position",   # Your custom endpoint name
+                        limit=5000
                     )
                     
+                    # Check if response has data
                     if hasattr(response, "result") and response.result:
-                        # Clear old positions
-                        db.query(Position).delete()
+                        rows = response.result.rows  # Extract rows from response
                         
-                        position_count = 0
-                        for row in response.result.rows:
-                            position = Position(
-                                borrower_address=row.get('borrower_address'),
-                                chain=row.get('chain'),
-                                token_symbol=row.get('token_symbol'),
-                                token_address=row.get('token_address'),
-                                collateral_amount=row.get('collateral_amount'),
-                                debt_amount=row.get('debt_amount'),
-                                health_factor=row.get('health_factor'),
-                                total_collateral_usd=row.get('total_collateral_usd'),
-                                total_debt_usd=row.get('total_debt_usd'),
-                                enhanced_health_factor=row.get('enhanced_health_factor'),
-                                risk_category=row.get('risk_category'),
-                                last_updated=datetime.now(timezone.utc)
-                            )
-                            db.add(position)
-                            position_count += 1
-                        
-                        db.commit()
+                        if rows:
+                            # Clear old positions
+                            db.query(Position).delete()
+                            
+                            position_count = 0
+                            for row in rows:
+                                position = Position(
+                                    borrower_address=row.get('borrower_address'),
+                                    chain=row.get('chain'),
+                                    token_symbol=row.get('token_symbol'),
+                                    token_address=row.get('token_address'),
+                                    collateral_amount=row.get('collateral_amount'),
+                                    debt_amount=row.get('debt_amount'),
+                                    health_factor=row.get('health_factor'),
+                                    total_collateral_usd=row.get('total_collateral_usd'),
+                                    total_debt_usd=row.get('total_debt_usd'),
+                                    enhanced_health_factor=row.get('enhanced_health_factor'),
+                                    risk_category=row.get('risk_category'),
+                                    last_updated=datetime.now(timezone.utc)
+                                )
+                                db.add(position)
+                                position_count += 1
+                            
+                            db.commit()
+                            results["positions"] = {
+                                "status": "success",
+                                "count": position_count
+                            }
+                            logger.info(f"✅ Stored {position_count} positions")
+                        else:
+                            results["positions"] = {
+                                "status": "success",
+                                "count": 0,
+                                "note": "Response has no rows"
+                            }
+                    else:
                         results["positions"] = {
-                            "status": "success",
-                            "count": position_count
+                            "status": "error",
+                            "error": "No result in response"
                         }
-                        logger.info(f"✅ Stored {position_count} positions")
                 else:
                     results["positions"] = {
                         "status": "skipped",
@@ -333,65 +356,92 @@ async def unified_data_refresh(
                     }
                     
             except Exception as e:
+                import traceback
                 logger.error(f"Position refresh failed: {e}")
+                logger.error(traceback.format_exc())
                 results["positions"] = {"status": "error", "error": str(e)}
-        
-        # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) ==========
 
+        # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) - CUSTOM ENDPOINT ==========
         if request.refresh_liquidations and not request.prices_only:
             logger.info("🔄 Refreshing liquidation data from Dune...")
             try:
                 dune_key = os.getenv("DUNE_API_KEY_LIQUIDATION_HISTORY")
                 if dune_key:
+                    from dune_client.client import DuneClient
+                    
                     dune = DuneClient(api_key=dune_key)
+                    
+                    # ✅ CORRECT METHOD - Same as your sync_dune_data.py
+                    logger.info("Calling Dune custom endpoint: firstbml/liquidation-history")
                     response = dune.get_custom_endpoint_result(
-                        "firstbml", "liquidation-history", limit=5000
+                        "firstbml",              # Your Dune username
+                        "liquidation-history",   # Your custom endpoint name
+                        limit=5000
                     )
                     
+                    # Check if response has data
                     if hasattr(response, "result") and response.result:
-                        # Clear old liquidations
-                        db.query(LiquidationHistory).delete()
+                        rows = response.result.rows
                         
-                        liq_count = 0
-                        for row in response.result.rows:
-                            # Calculate USD value
-                            collateral_seized = row.get('total_collateral_seized', 0) or 0
-                            liquidated_usd = 0.0
+                        if rows:
+                            # Clear old liquidations
+                            db.query(LiquidationHistory).delete()
                             
-                            if collateral_seized > 0:
-                                symbol = row.get('collateral_symbol')
-                                price_data = price_fetcher.get_batch_prices([{
-                                    'symbol': symbol,
-                                    'address': row.get('collateral_token'),
-                                    'chain': row.get('chain')
-                                }])
-                                if symbol in price_data:
-                                    price = price_data[symbol].get('price', 0)
-                                    liquidated_usd = collateral_seized * price
+                            liq_count = 0
+                            for row in rows:
+                                # Calculate USD value
+                                collateral_seized = row.get('total_collateral_seized', 0) or 0
+                                liquidated_usd = 0.0
+                                
+                                if collateral_seized > 0:
+                                    symbol = row.get('collateral_symbol')
+                                    if symbol:
+                                        try:
+                                            price_data = price_fetcher.get_batch_prices([{
+                                                'symbol': symbol,
+                                                'address': row.get('collateral_token'),
+                                                'chain': row.get('chain')
+                                            }])
+                                            if symbol in price_data:
+                                                price = price_data[symbol].get('price', 0)
+                                                liquidated_usd = collateral_seized * price
+                                        except Exception as price_err:
+                                            logger.warning(f"Failed to get price for {symbol}: {price_err}")
+                                
+                                liquidation = LiquidationHistory(
+                                    liquidation_date=pd.to_datetime(row.get('liquidation_date')) if row.get('liquidation_date') else datetime.now(timezone.utc),
+                                    chain=row.get('chain'),
+                                    borrower=row.get('borrower'),
+                                    collateral_symbol=row.get('collateral_symbol'),
+                                    debt_symbol=row.get('debt_symbol'),
+                                    collateral_asset=row.get('collateral_token'),
+                                    debt_asset=row.get('debt_token'),
+                                    total_collateral_seized=collateral_seized,
+                                    total_debt_normalized=row.get('total_debt_normalized'),
+                                    liquidated_collateral_usd=liquidated_usd,
+                                    liquidation_count=row.get('liquidation_count'),
+                                    query_time=datetime.now(timezone.utc)
+                                )
+                                db.add(liquidation)
+                                liq_count += 1
                             
-                            liquidation = LiquidationHistory(
-                                liquidation_date=pd.to_datetime(row.get('liquidation_date')),
-                                chain=row.get('chain'),
-                                borrower=row.get('borrower'),
-                                collateral_symbol=row.get('collateral_symbol'),
-                                debt_symbol=row.get('debt_symbol'),
-                                collateral_asset=row.get('collateral_token'),
-                                debt_asset=row.get('debt_token'),
-                                total_collateral_seized=collateral_seized,
-                                total_debt_normalized=row.get('total_debt_normalized'),
-                                liquidated_collateral_usd=liquidated_usd,
-                                liquidation_count=row.get('liquidation_count'),
-                                query_time=datetime.now(timezone.utc)
-                            )
-                            db.add(liquidation)
-                            liq_count += 1
-                        
-                        db.commit()
+                            db.commit()
+                            results["liquidations"] = {
+                                "status": "success",
+                                "count": liq_count
+                            }
+                            logger.info(f"✅ Stored {liq_count} liquidations")
+                        else:
+                            results["liquidations"] = {
+                                "status": "success",
+                                "count": 0,
+                                "note": "Response has no rows"
+                            }
+                    else:
                         results["liquidations"] = {
-                            "status": "success",
-                            "count": liq_count
+                            "status": "error",
+                            "error": "No result in response"
                         }
-                        logger.info(f"✅ Stored {liq_count} liquidations")
                 else:
                     results["liquidations"] = {
                         "status": "skipped",
@@ -399,9 +449,11 @@ async def unified_data_refresh(
                     }
                     
             except Exception as e:
+                import traceback
                 logger.error(f"Liquidation refresh failed: {e}")
+                logger.error(traceback.format_exc())
                 results["liquidations"] = {"status": "error", "error": str(e)}
-        
+                
         # ========== 4. REFRESH PRICES ONLY (FAST) ==========
         if request.prices_only:
             logger.info("🔄 Refreshing prices only...")

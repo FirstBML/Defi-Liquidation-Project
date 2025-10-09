@@ -1,212 +1,213 @@
 """
-Database models - SQLAlchemy 1.4 compatible
+Database models with fixed Railway PostgreSQL connection
 """
-from sqlalchemy import Column, Integer, String, Float, DateTime, JSON, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import create_engine
 from datetime import datetime, timezone
 import os
 import logging
 
 logger = logging.getLogger(__name__)
 
-def get_database_url():
-    """Get database URL - works for both SQLite and PostgreSQL"""
-    database_url = os.getenv("DATABASE_URL")
-    
-    if database_url and database_url.startswith("postgres"):
-        # PostgreSQL on Railway
-        if database_url.startswith("postgres://"):
-            database_url = database_url.replace("postgres://", "postgresql://", 1)
-        logger.info("✅ Using PostgreSQL (Railway)")
-        return database_url
-    else:
-        # SQLite for local development
-        logger.info("✅ Using SQLite (local development)")
-        return "sqlite:///./aave_risk.db"
-
-def create_database_engine():
-    """Create database engine"""
-    database_url = get_database_url()
-    
-    try:
-        if database_url.startswith("postgresql://"):
-            engine = create_engine(database_url)
-            logger.info("✅ PostgreSQL engine created")
-        else:
-            # SQLite for local development
-            engine = create_engine(database_url)
-            logger.info("✅ SQLite engine created")
-        return engine
-    except Exception as e:
-        logger.error(f"❌ Database engine creation failed: {e}")
-        # Ultimate fallback to SQLite
-        return create_engine("sqlite:///./aave_risk.db")
-
-# Create engine and session
-engine = create_database_engine()
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# ==================== DATABASE CONNECTION ====================
+
+def get_database_url():
+    """Get database URL with proper error handling"""
+    
+    # Railway provides DATABASE_URL automatically
+    db_url = os.getenv("DATABASE_URL")
+    
+    if db_url:
+        # Railway PostgreSQL URLs start with postgres://
+        # SQLAlchemy 1.4+ requires postgresql://
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        
+        logger.info("✅ Using PostgreSQL (Railway)")
+        return db_url
+    
+    # Fallback to SQLite for local development
+    logger.info("⚠️ No DATABASE_URL found, using SQLite (local dev)")
+    return "sqlite:///./aave_risk.db"
+
+try:
+    DATABASE_URL = get_database_url()
+    
+    # Create engine with appropriate settings
+    if DATABASE_URL.startswith("postgresql://"):
+        # PostgreSQL settings
+        engine = create_engine(
+            DATABASE_URL,
+            pool_pre_ping=True,  # Verify connections before using
+            pool_recycle=3600,   # Recycle connections after 1 hour
+            connect_args={
+                "connect_timeout": 10,
+                "options": "-c timezone=utc"
+            }
+        )
+    else:
+        # SQLite settings
+        engine = create_engine(
+            DATABASE_URL,
+            connect_args={"check_same_thread": False}
+        )
+    
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    
+    logger.info("✅ Database engine created successfully")
+    
+except Exception as e:
+    logger.error(f"❌ Database engine creation failed: {e}")
+    # Fallback to SQLite if PostgreSQL fails
+    logger.info("🔄 Falling back to SQLite...")
+    DATABASE_URL = "sqlite:///./aave_risk.db"
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# ==================== MODELS ====================
+
 class Reserve(Base):
-    """Reserve model aligned with RPC blockchain data"""
+    """RPC-sourced reserve data"""
     __tablename__ = "reserves"
     
     id = Column(Integer, primary_key=True, index=True)
-    
-    # Identification
-    chain = Column(String(50), index=True, nullable=False)
-    token_address = Column(String(100), index=True, nullable=False)
-    token_symbol = Column(String(50), index=True)
-    token_name = Column(String(200))
+    chain = Column(String, index=True)
+    token_address = Column(String, index=True)
+    token_symbol = Column(String, index=True)
+    token_name = Column(String, nullable=True)
     decimals = Column(Integer)
     
-    # Interest rates (decimal format, not percentages)
-    liquidity_rate = Column(Float)
-    variable_borrow_rate = Column(Float)
-    stable_borrow_rate = Column(Float)
+    # Interest rates (raw values from contract)
+    liquidity_rate = Column(Float, nullable=True)
+    variable_borrow_rate = Column(Float, nullable=True)
+    stable_borrow_rate = Column(Float, nullable=True)
     
-    # Percentage formats for display
-    supply_apy = Column(Float)
-    borrow_apy = Column(Float)
+    # APYs (calculated)
+    supply_apy = Column(Float, nullable=True)
+    borrow_apy = Column(Float, nullable=True)
     
-    # Risk parameters (decimal format: 0.0 to 1.0)
-    ltv = Column(Float)
-    liquidation_threshold = Column(Float)
-    liquidation_bonus = Column(Float)
+    # Risk parameters
+    ltv = Column(Float, nullable=True)
+    liquidation_threshold = Column(Float, nullable=True)
+    liquidation_bonus = Column(Float, nullable=True)
     
-    # Reserve status flags
+    # Status flags
     is_active = Column(Boolean, default=True)
     is_frozen = Column(Boolean, default=False)
     borrowing_enabled = Column(Boolean, default=True)
     stable_borrowing_enabled = Column(Boolean, default=False)
     
     # Indices
-    liquidity_index = Column(Float)
-    variable_borrow_index = Column(Float)
+    liquidity_index = Column(Float, nullable=True)
+    variable_borrow_index = Column(Float, nullable=True)
     
-    # Contract addresses
-    atoken_address = Column(String(100))
-    variable_debt_token_address = Column(String(100))
+    # Token addresses
+    atoken_address = Column(String, nullable=True)
+    variable_debt_token_address = Column(String, nullable=True)
     
-    # Pricing
-    price_usd = Column(Float)
+    # Price data
+    price_usd = Column(Float, nullable=True)
     price_available = Column(Boolean, default=False)
     
     # Timestamps
-    last_update_timestamp = Column(Integer)
-    query_time = Column(DateTime, default=datetime.now(timezone.utc))
-    created_at = Column(DateTime, default=datetime.now(timezone.utc))
+    last_update_timestamp = Column(Integer, nullable=True)
+    query_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 
 class Position(Base):
-    """Position model"""
+    """User positions (from Dune)"""
     __tablename__ = "positions"
     
     id = Column(Integer, primary_key=True, index=True)
+    borrower_address = Column(String, index=True)
+    chain = Column(String, index=True)
+    token_symbol = Column(String, index=True)
+    token_address = Column(String, nullable=True)
     
-    borrower_address = Column(String(100), nullable=False, index=True)
-    chain = Column(String(50))
+    collateral_amount = Column(Float, nullable=True)
+    debt_amount = Column(Float, nullable=True)
+    health_factor = Column(Float, nullable=True)
     
-    token_symbol = Column(String(50))
-    token_address = Column(String(100))
+    total_collateral_usd = Column(Float, nullable=True)
+    total_debt_usd = Column(Float, nullable=True)
     
-    collateral_amount = Column(Float)
-    debt_amount = Column(Float)
-    health_factor = Column(Float)
-    total_collateral_usd = Column(Float)
-    total_debt_usd = Column(Float)
+    enhanced_health_factor = Column(Float, nullable=True)
+    risk_category = Column(String, nullable=True)
+    liquidation_threshold = Column(Float, nullable=True)
     
-    enhanced_health_factor = Column(Float)
-    risk_category = Column(String(50))
-    current_ltv = Column(Float)
-    liquidation_price = Column(Float)
-    price_drop_to_liquidation_pct = Column(Float)
-    position_size_category = Column(String(50))
-    
-    current_collateral_usd = Column(Float)
-    current_price = Column(Float)
-    price_available = Column(Boolean, default=False)
-    
-    last_updated = Column(DateTime)
-    query_time = Column(DateTime)
+    last_updated = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    query_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 
 class LiquidationHistory(Base):
-    """Liquidation history"""
+    """Liquidation events (from Dune)"""
     __tablename__ = "liquidation_history"
     
     id = Column(Integer, primary_key=True, index=True)
-    
-    tx_hash = Column(String(100), index=True)
-    block_number = Column(Integer)
     liquidation_date = Column(DateTime, index=True)
-    chain = Column(String(50))
+    chain = Column(String, index=True)
     
-    liquidator = Column(String(100), index=True)
-    borrower = Column(String(100), index=True)
+    borrower = Column(String, nullable=True)
+    liquidator = Column(String, nullable=True)
     
-    collateral_asset = Column(String(100))
-    collateral_symbol = Column(String(50))
-    debt_asset = Column(String(100))
-    debt_symbol = Column(String(50))
+    collateral_symbol = Column(String, nullable=True)
+    debt_symbol = Column(String, nullable=True)
+    collateral_asset = Column(String, nullable=True)
+    debt_asset = Column(String, nullable=True)
     
-    liquidated_collateral_amount = Column(Float)
-    liquidated_debt_amount = Column(Float)
-    liquidated_collateral_usd = Column(Float)
-    liquidated_debt_usd = Column(Float)
+    total_collateral_seized = Column(Float, nullable=True)
+    total_debt_normalized = Column(Float, nullable=True)
     
-    total_collateral_seized = Column(Float)
-    total_debt_normalized = Column(Float)
-    liquidation_count = Column(Integer)
-    avg_debt_per_event = Column(Float)
-    unique_liquidators = Column(Integer)
+    # USD values
+    liquidated_collateral_usd = Column(Float, nullable=True)
+    liquidated_debt_usd = Column(Float, nullable=True)
     
-    health_factor_before = Column(Float)
-    total_collateral_before = Column(Float)
-    total_debt_before = Column(Float)
-    health_factor_after = Column(Float)
+    # Metadata
+    liquidation_count = Column(Integer, nullable=True)
+    avg_debt_per_event = Column(Float, nullable=True)
+    unique_liquidators = Column(Integer, nullable=True)
+    health_factor_before = Column(Float, nullable=True)
     
-    gas_used = Column(Float)
-    gas_price = Column(Float)
-    gas_cost_usd = Column(Float)
-    
-    created_at = Column(DateTime, default=datetime.now(timezone.utc))
-    query_time = Column(DateTime, default=datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    query_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 
 class AnalysisSnapshot(Base):
-    """Analysis snapshots"""
+    """Periodic analysis snapshots"""
     __tablename__ = "analysis_snapshots"
     
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, nullable=False, default=datetime.now(timezone.utc))
-    summary = Column(JSON, nullable=False)
+    snapshot_time = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
     
     total_positions = Column(Integer)
-    critical_positions = Column(Integer)
-    protocol_ltv = Column(Float)
     total_collateral_usd = Column(Float)
     total_debt_usd = Column(Float)
-    analysis_duration_seconds = Column(Float)
-    price_data_coverage = Column(Float)
-    positions_analyzed = Column(Integer)
+    avg_health_factor = Column(Float, nullable=True)
+    
+    critical_positions = Column(Integer, nullable=True)
+    high_risk_positions = Column(Integer, nullable=True)
+    
+    scenario_data = Column(Text, nullable=True)  # JSON string
+    alert_summary = Column(Text, nullable=True)  # JSON string
 
-def initialize_database():
-    """Initialize database"""
+
+# ==================== INITIALIZATION ====================
+
+def init_db():
+    """Initialize database tables"""
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("✅ Database tables initialized")
-        return True
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
-        return False
+        raise
 
-# Initialize database
-initialize_database()
-
-def get_db():
-    """Database session dependency"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Auto-initialize on import
+init_db()
