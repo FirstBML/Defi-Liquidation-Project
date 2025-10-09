@@ -293,7 +293,7 @@ async def unified_data_refresh(
                 dune_key = os.getenv("DUNE_API_KEY_CURRENT_POSITION")
                 if dune_key:
                     dune = DuneClient(api_key=dune_key)
-                    response = dune.get_result(
+                    response = dune.get_custom_endpoint_result(
                         "firstbml", "current-position", limit=5000
                     )
                     
@@ -344,7 +344,7 @@ async def unified_data_refresh(
                 dune_key = os.getenv("DUNE_API_KEY_LIQUIDATION_HISTORY")
                 if dune_key:
                     dune = DuneClient(api_key=dune_key)
-                    response = dune.get_result(
+                    response = dune.get_custom_endpoint_result(
                         "firstbml", "liquidation-history", limit=5000
                     )
                     
