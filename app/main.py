@@ -11,7 +11,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi.responses import RedirectResponse
 from app import api
+import warnings
 
+
+warnings.filterwarnings('ignore', module='eth_utils')
 # Load environment variables FIRST
 load_dotenv()
 
