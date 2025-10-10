@@ -1756,3 +1756,202 @@ async def test_rpc_connection():
             }
     
     return results
+
+    """
+Add this to your api.py to show data freshness and cache status
+Insert after the /startup-status equivalent endpoint
+"""
+
+@router.get("/data/status")
+async def get_data_status(db: Session = Depends(get_db)):
+    """
+    Check data availability and freshness
+    Shows if database has data and how old it is
+    """
+    try:
+        from datetime import timedelta
+        
+        now = datetime.now(timezone.utc)
+        status = {
+            "timestamp": now.isoformat(),
+            "database_connected": True,
+            "data_available": False,
+            "data_age_status": "unknown",
+            "sources": {}
+        }
+        
+        # Check reserves
+        reserve_count = db.query(Reserve).count()
+        latest_reserve = db.query(Reserve).order_by(Reserve.query_time.desc()).first()
+        
+        if latest_reserve:
+            age = now - latest_reserve.query_time.replace(tzinfo=timezone.utc)
+            age_hours = age.total_seconds() / 3600
+            
+            if age_hours < 6:
+                reserve_status = "fresh"
+            elif age_hours < 24:
+                reserve_status = "recent"
+            elif age_hours < 168:  # 1 week
+                reserve_status = "stale"
+            else:
+                reserve_status = "very_old"
+            
+            status["sources"]["reserves"] = {
+                "count": reserve_count,
+                "latest_update": latest_reserve.query_time.isoformat(),
+                "age_hours": round(age_hours, 2),
+                "status": reserve_status,
+                "chains": db.query(Reserve.chain).distinct().count()
+            }
+        else:
+            status["sources"]["reserves"] = {
+                "count": 0,
+                "status": "no_data",
+                "message": "⚠️ No reserve data - run /api/data/refresh"
+            }
+        
+        # Check positions
+        position_count = db.query(Position).count()
+        latest_position = db.query(Position).order_by(Position.last_updated.desc()).first()
+        
+        if latest_position:
+            age = now - latest_position.last_updated.replace(tzinfo=timezone.utc)
+            age_hours = age.total_seconds() / 3600
+            
+            if age_hours < 6:
+                position_status = "fresh"
+            elif age_hours < 24:
+                position_status = "recent"
+            elif age_hours < 168:
+                position_status = "stale"
+            else:
+                position_status = "very_old"
+            
+            status["sources"]["positions"] = {
+                "count": position_count,
+                "latest_update": latest_position.last_updated.isoformat(),
+                "age_hours": round(age_hours, 2),
+                "status": position_status,
+                "at_risk": db.query(Position).filter(
+                    Position.enhanced_health_factor < 1.5
+                ).count()
+            }
+        else:
+            status["sources"]["positions"] = {
+                "count": 0,
+                "status": "no_data",
+                "message": "⚠️ No position data - run /api/data/refresh"
+            }
+        
+        # Check liquidations
+        liq_count = db.query(LiquidationHistory).count()
+        latest_liq = db.query(LiquidationHistory).order_by(
+            LiquidationHistory.liquidation_date.desc()
+        ).first()
+        
+        if latest_liq:
+            # For liquidations, check the actual event date, not query time
+            age = now - latest_liq.liquidation_date.replace(tzinfo=timezone.utc)
+            age_days = age.total_seconds() / 86400
+            
+            status["sources"]["liquidations"] = {
+                "count": liq_count,
+                "latest_event": latest_liq.liquidation_date.isoformat(),
+                "age_days": round(age_days, 2),
+                "status": "recent" if age_days < 7 else "older",
+                "last_30_days": db.query(LiquidationHistory).filter(
+                    LiquidationHistory.liquidation_date >= now - timedelta(days=30)
+                ).count()
+            }
+        else:
+            status["sources"]["liquidations"] = {
+                "count": 0,
+                "status": "no_data",
+                "message": "⚠️ No liquidation data"
+            }
+        
+        # Overall status
+        has_reserves = reserve_count > 0
+        has_positions = position_count > 0
+        
+        if has_reserves and has_positions:
+            status["data_available"] = True
+            
+            # Determine overall age status
+            reserve_age = status["sources"]["reserves"].get("age_hours", 999)
+            position_age = status["sources"]["positions"].get("age_hours", 999)
+            oldest_age = max(reserve_age, position_age)
+            
+            if oldest_age < 6:
+                status["data_age_status"] = "fresh"
+                status["recommendation"] = "✅ Data is up to date"
+            elif oldest_age < 24:
+                status["data_age_status"] = "recent"
+                status["recommendation"] = "Data is reasonably fresh"
+            else:
+                status["data_age_status"] = "stale"
+                status["recommendation"] = "⚠️ Consider refreshing data at /api/data/refresh"
+        else:
+            status["data_available"] = False
+            status["data_age_status"] = "no_data"
+            status["recommendation"] = "❌ No data found - POST to /api/data/refresh to populate"
+        
+        return status
+        
+    except Exception as e:
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "database_connected": False,
+            "error": str(e),
+            "recommendation": "Check database connection"
+        }
+
+
+@router.get("/data/quick-stats")
+async def get_quick_stats(db: Session = Depends(get_db)):
+    """
+    Quick dashboard stats - minimal query overhead
+    """
+    try:
+        # Single queries for counts
+        reserve_count = db.query(func.count(Reserve.id)).scalar()
+        position_count = db.query(func.count(Position.id)).scalar()
+        liq_count = db.query(func.count(LiquidationHistory.id)).scalar()
+        
+        # At-risk positions count
+        at_risk = db.query(func.count(Position.id)).filter(
+            Position.enhanced_health_factor < 1.5,
+            Position.enhanced_health_factor > 0
+        ).scalar()
+        
+        # Critical positions
+        critical = db.query(func.count(Position.id)).filter(
+            Position.enhanced_health_factor < 1.1,
+            Position.enhanced_health_factor > 0
+        ).scalar()
+        
+        # Total value locked (approximate)
+        total_collateral = db.query(
+            func.sum(Position.total_collateral_usd)
+        ).scalar() or 0
+        
+        total_debt = db.query(
+            func.sum(Position.total_debt_usd)
+        ).scalar() or 0
+        
+        return {
+            "reserves": reserve_count,
+            "positions": position_count,
+            "liquidations_history": liq_count,
+            "at_risk_positions": at_risk,
+            "critical_positions": critical,
+            "total_collateral_usd": round(total_collateral, 2),
+            "total_debt_usd": round(total_debt, 2),
+            "protocol_ltv": round(total_debt / total_collateral, 4) if total_collateral > 0 else 0,
+            "has_data": reserve_count > 0 or position_count > 0,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
