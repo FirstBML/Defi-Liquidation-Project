@@ -286,8 +286,18 @@ async def unified_data_refresh(
                 logger.error(f"Reserve refresh failed: {e}")
                 results["reserves"] = {"status": "error", "error": str(e)}
         
-       
-        # ========== 2. REFRESH POSITIONS (FROM DUNE) - FIXED METHOD ==========
+       # ========== 2. REFRESH POSITIONS (FROM DUNE) - FIXED ==========
+        """
+        Fixed API with Dune Client Compatibility
+        Key fixes:
+        1. Removed query_id parameter (not supported in dune-client 1.9.1)
+        2. Using get_latest_result_dataframe() instead
+        3. Better error handling for Dune API calls
+        """
+
+        # In your api.py, replace the positions refresh section with this:
+
+        # ========== 2. REFRESH POSITIONS (FROM DUNE) - FIXED ==========
         if request.refresh_positions and not request.prices_only:
             logger.info("🔄 Refreshing position data from Dune...")
             try:
@@ -297,22 +307,35 @@ async def unified_data_refresh(
                     
                     dune = DuneClient(api_key=dune_key)
                     
-                    # ✅ CORRECT METHOD for dune-client 1.3.0+
+                    # ✅ CORRECT METHOD for dune-client 1.9.1
                     logger.info("Calling Dune API endpoint...")
                     
-                    # Try new method first (v1.4.0+)
+                    # Use the correct method for your dune-client version
                     try:
-                        response = dune.get_result_by_query_name(
-                            namespace="firstbml",
-                            query_name="current-position",
-                            limit=5000
-                        )
-                        rows = response.result.rows if hasattr(response, 'result') and response.result else []
-                    except AttributeError:
-                        # Fallback to older method
-                        logger.info("Trying legacy Dune API method...")
-                        response = dune.get_latest_result(query_id=5780129)  # Your query ID
-                        rows = response.get_rows() if response else []
+                        # Method 1: Using query ID directly (most compatible)
+                        query_id = 4559935  # Your current-position query ID
+                        result = dune.get_latest_result(query_id)
+                        
+                        # Extract rows based on result type
+                        if hasattr(result, 'get_rows'):
+                            rows = result.get_rows()
+                        elif hasattr(result, 'result') and hasattr(result.result, 'rows'):
+                            rows = result.result.rows
+                        else:
+                            # Fallback: try to access as dict
+                            rows = result.get('result', {}).get('rows', [])
+                        
+                        logger.info(f"Got {len(rows) if rows else 0} rows from Dune")
+                        
+                    except Exception as e:
+                        logger.error(f"Dune API error: {e}")
+                        # Try alternative method
+                        try:
+                            result_df = dune.get_latest_result_dataframe(query_id)
+                            rows = result_df.to_dict('records') if result_df is not None else []
+                        except Exception as e2:
+                            logger.error(f"Dataframe method also failed: {e2}")
+                            rows = []
                     
                     if rows:
                         # Clear old positions
@@ -361,7 +384,7 @@ async def unified_data_refresh(
                 logger.error(traceback.format_exc())
                 results["positions"] = {"status": "error", "error": str(e)}
 
-        # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) - FIXED METHOD ==========
+        # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) - FIXED ==========
         if request.refresh_liquidations and not request.prices_only:
             logger.info("🔄 Refreshing liquidation data from Dune...")
             try:
@@ -371,22 +394,31 @@ async def unified_data_refresh(
                     
                     dune = DuneClient(api_key=dune_key)
                     
-                    # ✅ CORRECT METHOD for dune-client 1.3.0+
                     logger.info("Calling Dune API endpoint...")
                     
-                    # Try new method first (v1.3.0+)
                     try:
-                        response = dune.get_result_by_query_name(
-                            namespace="firstbml",
-                            query_name="liquidation-history",
-                            limit=5000
-                        )
-                        rows = response.result.rows if hasattr(response, 'result') and response.result else []
-                    except AttributeError:
-                        # Fallback to older method
-                        logger.info("Trying legacy Dune API method...")
-                        response = dune.get_latest_result(query_id=5774891)  # Your query ID
-                        rows = response.get_rows() if response else []
+                        # Use query ID directly
+                        query_id = 4559847  # Your liquidation-history query ID
+                        result = dune.get_latest_result(query_id)
+                        
+                        # Extract rows
+                        if hasattr(result, 'get_rows'):
+                            rows = result.get_rows()
+                        elif hasattr(result, 'result') and hasattr(result.result, 'rows'):
+                            rows = result.result.rows
+                        else:
+                            rows = result.get('result', {}).get('rows', [])
+                        
+                        logger.info(f"Got {len(rows) if rows else 0} liquidation rows from Dune")
+                        
+                    except Exception as e:
+                        logger.error(f"Dune API error: {e}")
+                        try:
+                            result_df = dune.get_latest_result_dataframe(query_id)
+                            rows = result_df.to_dict('records') if result_df is not None else []
+                        except Exception as e2:
+                            logger.error(f"Dataframe method also failed: {e2}")
+                            rows = []
                     
                     if rows:
                         # Clear old liquidations
