@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from fastapi.responses import RedirectResponse
 import warnings
 import logging
+import sys
+
 
 # Setup logging FIRST
 logging.basicConfig(
@@ -208,24 +210,12 @@ def startup_status():
         "database_url_set": bool(os.getenv("DATABASE_URL"))
     }
 
-
-# ------------------------------------------------------
-# 🔹 Run (Railway uses this)
-# ------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    
-    # Railway sets PORT environment variable
-    port = int(os.getenv("PORT", 8080))
-    host = "0.0.0.0"  # Must be 0.0.0.0 for Railway
-    
-    logger.info(f"🔌 PORT environment variable: {os.getenv('PORT', 'not set')}")
-    logger.info(f"🚀 Starting server on {host}:{port}")
-    
-    uvicorn.run(
-        "app.main:app",
-        host=host,
-        port=port,
-        reload=False,  # Disable reload in production
-        log_level="info"
-    )
+@app.on_event("startup")
+async def startup_diagnostic():
+    logger.info("=== STARTUP DIAGNOSTICS ===")
+    logger.info(f"PORT: {os.getenv('PORT')}")
+    logger.info(f"DATABASE_URL: {'SET' if os.getenv('DATABASE_URL') else 'NOT SET'}")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Working directory: {os.getcwd()}")
+    logger.info(f"Files in app/: {os.listdir('app')}")
+    logger.info("=========================")

@@ -1724,3 +1724,4 @@ async def get_available_chains(db: Session = Depends(get_db)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
