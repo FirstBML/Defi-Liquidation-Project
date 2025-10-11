@@ -111,7 +111,7 @@ ALLOWED_ORIGINS = [
     "https://perspectively-slaty-sheilah.ngrok-free.dev",
     "http://localhost:3000",
     "https://localhost:3000",
-    "https://easygoing-charm-production-707b.up.railway.app",
+    "https://friendly-vitality-production.up.railway.app",
     "https://*.railway.app",
     "https://*.vercel.app",  # This will allow all Vercel domains
     "*"  # Keep for development, remove in production
