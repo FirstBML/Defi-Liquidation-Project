@@ -14,7 +14,6 @@ import warnings
 import logging
 import sys
 
-
 # Setup logging FIRST
 logging.basicConfig(
     level=logging.INFO,
@@ -109,12 +108,11 @@ app = FastAPI(
 # ------------------------------------------------------
 ALLOWED_ORIGINS = [
     "https://perspectively-slaty-sheilah.ngrok-free.dev",
+    "https://your-vercel-dashboard.vercel.app",
     "http://localhost:3000",
-    "https://localhost:3000",
-    "https://friendly-vitality-production.up.railway.app",
-    "https://*.railway.app",
-    "https://*.vercel.app",  # This will allow all Vercel domains
-    "*"  # Keep for development, remove in production
+    "https://easygoing-charm-production-707b.up.railway.app",
+    "https://*.railway.app",  # Allow all Railway subdomains
+    "*"  # Development only - REMOVE IN PRODUCTION
 ]
 
 app.add_middleware(
