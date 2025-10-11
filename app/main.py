@@ -109,11 +109,12 @@ app = FastAPI(
 # ------------------------------------------------------
 ALLOWED_ORIGINS = [
     "https://perspectively-slaty-sheilah.ngrok-free.dev",
-    "https://your-vercel-dashboard.vercel.app",
     "http://localhost:3000",
+    "https://localhost:3000",
     "https://easygoing-charm-production-707b.up.railway.app",
-    "https://*.railway.app",  # Allow all Railway subdomains
-    "*"  # Development only - REMOVE IN PRODUCTION
+    "https://*.railway.app",
+    "https://*.vercel.app",  # This will allow all Vercel domains
+    "*"  # Keep for development, remove in production
 ]
 
 app.add_middleware(
