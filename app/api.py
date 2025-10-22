@@ -1,57 +1,175 @@
 """
-Updated API with Reserve Endpoints
+Consolidated API with All Endpoints - FIXED VERSION
+All critical fixes applied + request not defined errors fixed
 """
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
-from datetime import datetime, timezone
-from sqlalchemy import func, desc
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import func, desc, case, and_
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
-
+from pydantic import BaseModel, EmailStr
+from collections import defaultdict, Counter
+from sqlalchemy.pool import StaticPool
 import os
 import pandas as pd
-
+import logging
+from collections import defaultdict
+from fastapi import HTTPException
+from pydantic import BaseModel
+import json
+import time
+from web3 import Web3
+# Import database models
 from .db_models import SessionLocal, Reserve, Position, LiquidationHistory, AnalysisSnapshot
+from .db_models import User, AlertSubscription, MonitoredAddress, AlertHistory
+from .db_models import PositionSnapshot, RiskMetricHistory, PriceMovement
+
+# Import services
 from .rpc_reserve_fetcher import AaveRPCReserveFetcher
 from .price_fetcher import EnhancedPriceFetcher
+from .portfolio_tracker_service import PortfolioTrackerService
+from .alert_service import AlertService
 from .config import get_settings
 
-import logging
+logger = logging.getLogger(__name__)
 
-# Add this at the top of api.py after imports
+# Create two routers - one for v1, one for v2
+router_v1 = APIRouter(prefix="/api", tags=["API v1"])
+router_v2 = APIRouter(prefix="/api/v2", tags=["User Alerts & Portfolio"])
+
+# Fallback liquidation thresholds
 FALLBACK_LIQUIDATION_THRESHOLDS = {
-    # Ethereum mainnet tokens
     'WETH': 0.825, 'WBTC': 0.70, 'USDC': 0.875, 'DAI': 0.77,
     'USDT': 0.80, 'LINK': 0.70, 'AAVE': 0.66, 'UNI': 0.70,
     'WMATIC': 0.70, 'stETH': 0.825, 'wstETH': 0.825,
-    
-    # Polygon tokens
     'MATIC': 0.70, 'MaticX': 0.70, 'WPOL': 0.70,
-    
-    # Arbitrum/Optimism
     'ARB': 0.70, 'OP': 0.70,
-    
-    # Avalanche
     'AVAX': 0.70, 'WAVAX': 0.70,
-    
-    # Celo-specific tokens (add more as needed)
     'CELO': 0.70, 'cUSD': 0.85, 'cEUR': 0.85, 'cREAL': 0.85,
     'USDC.e': 0.875,
-    
-    # Pendle tokens
     'PT-sUSDE-27NOV2025': 0.75,
-    
-    # Default for unknown tokens
     'DEFAULT': 0.75
 }
 
-def get_liquidation_threshold(db: Session, chain: str, token_symbol: str) -> tuple[float, str]:
+# Initialize services (will be done in main app startup)
+portfolio_service = None
+alert_service = None
+
+def init_services():
+    """Initialize services - call this from main app startup"""
+    global portfolio_service, alert_service
+    portfolio_service = PortfolioTrackerService()
+    alert_service = AlertService()
+
+# FIX 1: Clean token symbols helper
+def clean_token_symbol(symbol):
+    """Clean garbled token symbols"""
+    if not symbol:
+        return "UNKNOWN"
+    # Remove null bytes and non-printable characters
+    cleaned = ''.join(char for char in symbol if char.isprintable() and char != '\x00')
+    return cleaned.strip() or "UNKNOWN"
+
+# FIX 9: Round all metrics helper
+def round_metrics(data, exclude_keys=None):
+    """Recursively round float values to 2 decimals"""
+    exclude_keys = exclude_keys or ['token_amount', 'collateral_amount', 'debt_amount', 
+                                     'total_collateral_seized', 'total_debt_normalized']
+    
+    if isinstance(data, dict):
+        return {
+            k: round_metrics(v, exclude_keys) if k not in exclude_keys else v
+            for k, v in data.items()
+        }
+    elif isinstance(data, list):
+        return [round_metrics(item, exclude_keys) for item in data]
+    elif isinstance(data, float):
+        return round(data, 2)
+    return data
+
+# FIX 2: Risk category calculation helper
+def get_risk_category(health_factor):
+    """Calculate risk category from health factor"""
+    if not health_factor or health_factor >= 999:
+        return "SAFE"
+    elif health_factor >= 2.0:
+        return "SAFE"
+    elif health_factor >= 1.5:
+        return "LOW_RISK"
+    elif health_factor >= 1.3:
+        return "MEDIUM_RISK"
+    elif health_factor >= 1.1:
+        return "HIGH_RISK"
+    elif health_factor >= 1.0:
+        return "CRITICAL"
+    else:
+        return "LIQUIDATION_IMMINENT"
+
+# FIX 3: Universal null handler
+def safe_display(value, field_type="string", unavailable_text="Avail Soon"):
     """
-    Get liquidation threshold with fallback logic
-    Returns: (threshold_value, source)
-    source can be: 'reserve', 'fallback', 'default'
+    Universal null/zero handler for API responses
+    
+    Args:
+        value: The value to check
+        field_type: 'string', 'number', 'array'
+        unavailable_text: Text to display for unavailable data
     """
-    # Try to get from Reserve table (latest record)
+    if value is None:
+        return unavailable_text if field_type == "string" else None
+    
+    if field_type == "number" and value == 0:
+        return unavailable_text
+    
+    if field_type == "array" and not value:
+        return []
+    
+    return value
+# Add this after the existing helper functions (e.g., after get_risk_category around line 150-200)
+
+def fix_null_fields_in_portfolio_response(portfolio_data):
+    """Fix null fields in portfolio response to prevent frontend errors"""
+    
+    # Fix chains_with_positions
+    if 'total_metrics' in portfolio_data:
+        if not portfolio_data['total_metrics'].get('chains_with_positions'):
+            portfolio_data['total_metrics']['chains_with_positions'] = list(portfolio_data.get('portfolio_data', {}).keys())
+    
+    # Fix safest_chain in risk_assessment
+    if 'cross_chain_risk' in portfolio_data:
+        if not portfolio_data['cross_chain_risk'].get('safest_chain'):
+            # Find the chain with highest health factor
+            chain_hfs = {}
+            for chain_name, chain_data in portfolio_data.get('portfolio_data', {}).items():
+                hf = chain_data.get('account_data', {}).get('health_factor')
+                if hf and hf < 999:  # Exclude infinite HF (collateral-only)
+                    chain_hfs[chain_name] = hf
+            
+            if chain_hfs:
+                portfolio_data['cross_chain_risk']['safest_chain'] = max(chain_hfs, key=chain_hfs.get)
+            elif portfolio_data.get('portfolio_data'):
+                # Fallback: First active chain if no valid HF
+                portfolio_data['cross_chain_risk']['safest_chain'] = list(portfolio_data['portfolio_data'].keys())[0]
+            else:
+                portfolio_data['cross_chain_risk']['safest_chain'] = "N/A"
+    
+    return portfolio_data
+
+def get_db():
+    """
+    Database session dependency - FIXED for SQLite thread safety
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        # Remove the try-except around close() - let SQLAlchemy handle it
+        db.close()
+
+def get_liquidation_threshold(db: Session, chain: str, token_symbol: str) -> tuple:
+    """Get liquidation threshold with fallback logic"""
     reserve = db.query(Reserve).filter(
         Reserve.chain == chain,
         Reserve.token_symbol == token_symbol,
@@ -61,65 +179,79 @@ def get_liquidation_threshold(db: Session, chain: str, token_symbol: str) -> tup
     if reserve and reserve.liquidation_threshold:
         return (reserve.liquidation_threshold, 'reserve')
     
-    # Fallback to static mapping
     if token_symbol in FALLBACK_LIQUIDATION_THRESHOLDS:
         return (FALLBACK_LIQUIDATION_THRESHOLDS[token_symbol], 'fallback')
     
-    # Default
     logger.warning(f"No LT found for {token_symbol} on {chain}, using default 0.75")
     return (FALLBACK_LIQUIDATION_THRESHOLDS['DEFAULT'], 'default')
 
+# ==================== PYDANTIC MODELS ====================
 
-logger = logging.getLogger(__name__)
-router = APIRouter()
+class RefreshRequest(BaseModel):
+    chains: Optional[List[str]] = None
+    refresh_reserves: bool = True
+    refresh_positions: bool = True
+    refresh_liquidations: bool = True
+    prices_only: bool = False
 
-def get_db():
-    """Database session dependency"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+class UserCreate(BaseModel):
+    username: str
+    email: Optional[EmailStr] = None
+    telegram_chat_id: Optional[str] = None
+    slack_webhook_url: Optional[str] = None
 
-# ==================== BASIC ENDPOINTS ====================
+class AlertSubscriptionCreate(BaseModel):
+    channel_email: bool = False
+    channel_telegram: bool = False
+    channel_slack: bool = False
+    health_factor_threshold: float = 1.5
+    ltv_threshold: float = 0.75
+    alert_frequency_hours: int = 1
+    monitored_chains: List[str] = []
+    minimum_risk_level: str = "MEDIUM_RISK"
 
-@router.get("/")
+class MonitoredAddressCreate(BaseModel):
+    wallet_address: str
+    label: Optional[str] = None
+    custom_hf_threshold: Optional[float] = None
+    notify_on_all_changes: bool = False
+
+class PortfolioRequest(BaseModel):
+    wallet_address: str
+    chains: Optional[List[str]] = None
+
+# ==================== V1 ENDPOINTS ====================
+
+@router_v1.get("/")
 async def root():
-    """API root endpoint"""
     return {
         "message": "DeFi Liquidation Risk API",
         "version": "2.0.0",
         "status": "operational",
-        "data_source": "Blockchain RPC"
+        "endpoints": {
+            "v1": "/api",
+            "v2": "/api/v2"
+        }
     }
 
-@router.get("/health")
+@router_v1.get("/health")
 async def health_check():
-    """Health check"""
     return {"status": "healthy"}
 
-# ==================== RPC RESERVE ENDPOINTS ====================
-
-@router.get("/reserves/rpc")
+# FIX 4: Fixed chain_filter display
+@router_v1.get("/reserves/rpc")
 async def get_rpc_reserves(
-    chains: Optional[str] = None,  # Comma-separated: "ethereum,polygon"
+    chains: Optional[str] = None,
     active_only: bool = True,
     limit: Optional[int] = 100,
-    latest_only: bool = True,  # Only latest per token
+    latest_only: bool = True,
     db: Session = Depends(get_db)
 ):
-    """
-    Get RPC-sourced reserve data
-    Query params:
-    - chains: Comma-separated list (e.g., "ethereum,polygon,arbitrum")
-    - active_only: Only return active reserves (default: True)
-    - limit: Max results per chain
-    - latest_only: Only latest record per token (default: True)
-    """
+    """Get RPC-sourced reserve data"""
     try:
         query = db.query(Reserve)
         
-        # Multi-chain filter
+        chain_list = None
         if chains:
             chain_list = [c.strip().lower() for c in chains.split(',')]
             query = query.filter(Reserve.chain.in_(chain_list))
@@ -127,11 +259,7 @@ async def get_rpc_reserves(
         if active_only:
             query = query.filter(Reserve.is_active == True)
         
-        # Get latest only
         if latest_only:
-            from sqlalchemy import and_
-            
-            # Subquery for latest timestamp per token per chain
             subq = db.query(
                 Reserve.chain,
                 Reserve.token_address,
@@ -156,7 +284,7 @@ async def get_rpc_reserves(
         
         return {
             "count": len(reserves),
-            "chain_filter": chains,
+            "chain_filter": chain_list if chains else None,  # FIXED
             "reserves": [
                 {
                     "chain": r.chain,
@@ -179,186 +307,222 @@ async def get_rpc_reserves(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch reserves: {str(e)}")
 
+# Create a global executor for CPU-bound tasks
+executor = ThreadPoolExecutor(max_workers=3)
 
-# ==================== UNIFIED DATA REFRESH ENDPOINT ====================
+async def _fetch_reserves_background(db_session, chains, price_fetcher):
+    """Background task to fetch reserves (runs in thread pool) - FIXED with clean_token_symbol"""
+    try:
+        logger.info(f"🔄 Background: Fetching reserves for chains: {chains or 'all'}")
+        
+        loop = asyncio.get_event_loop()
+        
+        def fetch_sync():
+            from .rpc_reserve_fetcher import AaveRPCReserveFetcher
+            rpc_fetcher = AaveRPCReserveFetcher(price_fetcher=price_fetcher)
+            return rpc_fetcher.fetch_all_chains(chains=chains)
+        
+        all_data = await loop.run_in_executor(executor, fetch_sync)
+        
+        if not all_data:
+            logger.warning("❌ Background: No reserve data returned")
+            return 0
+        
+        stored_count = 0
+        for chain, df in all_data.items():
+            if df is None or df.empty:
+                continue
+                
+            logger.info(f"Background: Storing {len(df)} reserves from {chain}")
+            
+            for _, row in df.iterrows():
+                try:
+                    reserve = Reserve(
+                        chain=row.get('chain'),
+                        token_address=row.get('token_address'),
+                        token_symbol=clean_token_symbol(row.get('token_symbol')),  # FIX 1: CLEANED
+                        token_name=row.get('token_name'),
+                        decimals=row.get('decimals'),
+                        liquidity_rate=row.get('liquidity_rate'),
+                        variable_borrow_rate=row.get('variable_borrow_rate'),
+                        stable_borrow_rate=row.get('stable_borrow_rate'),
+                        supply_apy=row.get('supply_apy'),
+                        borrow_apy=row.get('borrow_apy'),
+                        ltv=row.get('ltv'),
+                        liquidation_threshold=row.get('liquidation_threshold'),
+                        liquidation_bonus=row.get('liquidation_bonus'),
+                        is_active=row.get('is_active', True),
+                        is_frozen=row.get('is_frozen', False),
+                        borrowing_enabled=row.get('borrowing_enabled', True),
+                        stable_borrowing_enabled=row.get('stable_borrowing_enabled', False),
+                        liquidity_index=row.get('liquidity_index'),
+                        variable_borrow_index=row.get('variable_borrow_index'),
+                        atoken_address=row.get('atoken_address'),
+                        variable_debt_token_address=row.get('variable_debt_token_address'),
+                        price_usd=row.get('price_usd', 0.0),
+                        price_available=row.get('price_available', False),
+                        last_update_timestamp=row.get('last_update_timestamp'),
+                        query_time=row.get('query_time', datetime.now(timezone.utc))
+                    )
+                    db_session.add(reserve)
+                    stored_count += 1
+                except Exception as row_error:
+                    logger.error(f"Failed to store reserve: {row_error}")
+                    continue
+        
+        if stored_count > 0:
+            db_session.commit()
+            logger.info(f"✅ Background: Stored {stored_count} reserves")
+        
+        return stored_count
+        
+    except Exception as e:
+        logger.error(f"❌ Background reserve fetch failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
 
-
-class RefreshRequest(BaseModel):
-    """Request model for data refresh"""
-    chains: Optional[List[str]] = None
-    refresh_reserves: bool = True
-    refresh_positions: bool = True
-    refresh_liquidations: bool = True
-    prices_only: bool = False  # If True, only update prices, not full RPC fetch
-
-@router.post("/data/refresh")
+@router_v1.post("/data/refresh")
 async def unified_data_refresh(
-    body: Optional[RefreshRequest] = None,
+    refresh_reserves: bool = Query(False, description="✅ Refresh reserve data from blockchain (background, ~20 min)"),
+    refresh_positions: bool = Query(False, description="✅ Refresh position data from Dune Analytics"),
+    refresh_liquidations: bool = Query(False, description="✅ Refresh liquidation history from Dune Analytics"),
+    prices_only: bool = Query(False, description="🔄 Only update prices for existing reserves"),
+    chains: Optional[List[str]] = Query(None, description="Specific chains to refresh (leave empty for all)"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db)
 ):
     """
-    🔄 UNIFIED DATA REFRESH ENDPOINT
+    🔄 CHECKBOX-BASED DATA REFRESH ENDPOINT
     
-    Refreshes all data sources:
-    - RPC Reserve data (from blockchain)
-    - Position data (from Dune)
-    - Liquidation history (from Dune)
-    - Token prices (from CoinGecko)
+    Check the boxes for what you want to refresh:
+    - Reserve data runs in background (~20 minutes)
+    - Positions and liquidations are immediate
+    - Prices only updates existing reserve prices quickly
     
-    Usage:
-    - Manual: POST /api/data/refresh
-    - Full refresh: {"refresh_reserves": true, "refresh_positions": true}
-    - Prices only: {"prices_only": true}
-    - Specific chains: {"chains": ["ethereum", "polygon"]}
+    Examples:
+    - Check "refresh_reserves" + select chains = Fetch reserve data for specific chains
+    - Check "refresh_positions" + "refresh_liquidations" = Quick update of positions & liquidations
+    - Check "prices_only" = Fast price update for existing reserves
     """
     try:
-        from .price_fetcher import EnhancedPriceFetcher
-        from .rpc_reserve_fetcher import AaveRPCReserveFetcher
         from dune_client.client import DuneClient
         
         settings = get_settings()
-        request = body or RefreshRequest()
         
         results = {
-            "timestamp": datetime.now(timezone.utc),
-            "chains": request.chains or "all",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "chains": chains or "all",
             "reserves": None,
             "positions": None,
             "liquidations": None,
-            "prices": None
+            "prices": None,
+            "errors": []
         }
         
-        # Initialize price fetcher (needed for everything)
+        # Validate at least one option selected
+        if not any([refresh_reserves, refresh_positions, refresh_liquidations, prices_only]):
+            return {
+                "status": "error",
+                "message": "Please select at least one refresh option",
+                "options": {
+                    "refresh_reserves": False,
+                    "refresh_positions": False,
+                    "refresh_liquidations": False,
+                    "prices_only": False
+                }
+            }
+        
+        logger.info(f"🔄 Refresh request: reserves={refresh_reserves}, positions={refresh_positions}, liquidations={refresh_liquidations}, prices_only={prices_only}")
         logger.info("Initializing price fetcher...")
         price_fetcher = EnhancedPriceFetcher(
             api_key=getattr(settings, 'COINGECKO_API_KEY', None)
         )
         
-        # ========== 1. REFRESH RESERVES ==========
-        if request.refresh_reserves and not request.prices_only:
-            logger.info("🔄 Refreshing reserve data from RPC...")
-            try:
-                rpc_fetcher = AaveRPCReserveFetcher(price_fetcher=price_fetcher)
-                all_data = rpc_fetcher.fetch_all_chains(chains=request.chains)
-                
-                stored_count = 0
-                for chain, df in all_data.items():
-                    for _, row in df.iterrows():
-                        reserve = Reserve(
-                            chain=row['chain'],
-                            token_address=row['token_address'],
-                            token_symbol=row['token_symbol'],
-                            token_name=row['token_name'],
-                            decimals=row['decimals'],
-                            liquidity_rate=row['liquidity_rate'],
-                            variable_borrow_rate=row['variable_borrow_rate'],
-                            stable_borrow_rate=row['stable_borrow_rate'],
-                            supply_apy=row['supply_apy'],
-                            borrow_apy=row['borrow_apy'],
-                            ltv=row['ltv'],
-                            liquidation_threshold=row['liquidation_threshold'],
-                            liquidation_bonus=row['liquidation_bonus'],
-                            is_active=row['is_active'],
-                            is_frozen=row['is_frozen'],
-                            borrowing_enabled=row['borrowing_enabled'],
-                            stable_borrowing_enabled=row['stable_borrowing_enabled'],
-                            liquidity_index=row['liquidity_index'],
-                            variable_borrow_index=row['variable_borrow_index'],
-                            atoken_address=row['atoken_address'],
-                            variable_debt_token_address=row['variable_debt_token_address'],
-                            price_usd=row.get('price_usd', 0.0),
-                            price_available=row.get('price_available', False),
-                            last_update_timestamp=row['last_update_timestamp'],
-                            query_time=row['query_time']
-                        )
-                        db.add(reserve)
-                        stored_count += 1
-                
-                db.commit()
-                results["reserves"] = {
-                    "status": "success",
-                    "count": stored_count,
-                    "chains_processed": list(all_data.keys())
-                }
-                logger.info(f"✅ Stored {stored_count} reserves")
-                
-            except Exception as e:
-                logger.error(f"Reserve refresh failed: {e}")
-                results["reserves"] = {"status": "error", "error": str(e)}
-        
-       # ========== 2. REFRESH POSITIONS (FROM DUNE) - FIXED ==========
-        """
-        Fixed API with Dune Client Compatibility
-        Key fixes:
-        1. Removed query_id parameter (not supported in dune-client 1.9.1)
-        2. Using get_latest_result_dataframe() instead
-        3. Better error handling for Dune API calls
-        """
-
-        # In your api.py, replace the positions refresh section with this:
-
-        # ========== 2. REFRESH POSITIONS (FROM DUNE) - FIXED ==========
-        if request.refresh_positions and not request.prices_only:
+        # ========== 1. RESERVES - START IN BACKGROUND ==========
+        if refresh_reserves and not prices_only:
+            logger.info("🔄 Starting reserve refresh in background...")
+            
+            chains_to_fetch = None
+            if chains:
+                chains_to_fetch = [c.lower() for c in chains if c and c.lower() not in ['string', 'all', 'none']]
+                if not chains_to_fetch:
+                    chains_to_fetch = None
+            
+            background_tasks.add_task(
+                _fetch_reserves_background,
+                db,
+                chains_to_fetch,
+                price_fetcher
+            )
+                        
+            results["reserves"] = {
+                "status": "processing",
+                "message": "Reserve fetch started in background (~20 min). Check /api/reserves/rpc later.",
+                "chains_requested": chains_to_fetch or "all"
+            }
+                    
+        # ========== 2. POSITIONS - IMMEDIATE ==========
+        if refresh_positions and not prices_only:
             logger.info("🔄 Refreshing position data from Dune...")
             try:
                 dune_key = os.getenv("DUNE_API_KEY_CURRENT_POSITION")
-                if dune_key:
-                    from dune_client.client import DuneClient
-                    
+                if not dune_key:
+                    results["positions"] = {
+                        "status": "skipped",
+                        "reason": "DUNE_API_KEY_CURRENT_POSITION not set"
+                    }
+                else:
                     dune = DuneClient(api_key=dune_key)
+                    query_id = 5780129
                     
-                    # ✅ CORRECT METHOD for dune-client 1.9.1
-                    logger.info("Calling Dune API endpoint...")
+                    logger.info(f"Fetching Dune query {query_id}...")
                     
-                    # Use the correct method for your dune-client version
+                    rows = None
                     try:
-                        # Method 1: Using query ID directly (most compatible)
-                        query_id = 4559935  # Your current-position query ID
                         result = dune.get_latest_result(query_id)
-                        
-                        # Extract rows based on result type
                         if hasattr(result, 'get_rows'):
                             rows = result.get_rows()
                         elif hasattr(result, 'result') and hasattr(result.result, 'rows'):
                             rows = result.result.rows
-                        else:
-                            # Fallback: try to access as dict
+                        elif isinstance(result, dict):
                             rows = result.get('result', {}).get('rows', [])
-                        
-                        logger.info(f"Got {len(rows) if rows else 0} rows from Dune")
-                        
-                    except Exception as e:
-                        logger.error(f"Dune API error: {e}")
-                        # Try alternative method
-                        try:
-                            result_df = dune.get_latest_result_dataframe(query_id)
-                            rows = result_df.to_dict('records') if result_df is not None else []
-                        except Exception as e2:
-                            logger.error(f"Dataframe method also failed: {e2}")
-                            rows = []
+                    except AttributeError:
+                        logger.info("Trying dataframe method...")
+                        result_df = dune.get_latest_result_dataframe(query_id)
+                        if result_df is not None and not result_df.empty:
+                            rows = result_df.to_dict('records')
                     
-                    if rows:
-                        # Clear old positions
+                    if rows and len(rows) > 0:
                         db.query(Position).delete()
+                        db.commit()
                         
                         position_count = 0
                         for row in rows:
-                            position = Position(
-                                borrower_address=row.get('borrower_address'),
-                                chain=row.get('chain'),
-                                token_symbol=row.get('token_symbol'),
-                                token_address=row.get('token_address'),
-                                collateral_amount=row.get('collateral_amount'),
-                                debt_amount=row.get('debt_amount'),
-                                health_factor=row.get('health_factor'),
-                                total_collateral_usd=row.get('total_collateral_usd'),
-                                total_debt_usd=row.get('total_debt_usd'),
-                                enhanced_health_factor=row.get('enhanced_health_factor'),
-                                risk_category=row.get('risk_category'),
-                                last_updated=datetime.now(timezone.utc)
-                            )
-                            db.add(position)
-                            position_count += 1
+                            try:
+                                # FIX 5: Calculate risk category during position refresh
+                                health_factor = row.get('enhanced_health_factor') or row.get('health_factor')
+                                risk_category = get_risk_category(health_factor)
+                                
+                                position = Position(
+                                    borrower_address=row.get('borrower_address'),
+                                    chain=row.get('chain'),
+                                    token_symbol=row.get('token_symbol'),
+                                    token_address=row.get('token_address'),
+                                    collateral_amount=row.get('collateral_amount'),
+                                    debt_amount=row.get('debt_amount'),
+                                    health_factor=row.get('health_factor'),
+                                    total_collateral_usd=row.get('total_collateral_usd'),
+                                    total_debt_usd=row.get('total_debt_usd'),
+                                    enhanced_health_factor=row.get('enhanced_health_factor'),
+                                    risk_category=risk_category,  # FIXED: Now populated
+                                    last_updated=datetime.now(timezone.utc)
+                                )
+                                db.add(position)
+                                position_count += 1
+                            except Exception as pos_error:
+                                logger.error(f"Failed to add position: {pos_error}")
+                                continue
                         
                         db.commit()
                         results["positions"] = {
@@ -372,128 +536,205 @@ async def unified_data_refresh(
                             "count": 0,
                             "note": "No rows returned from Dune"
                         }
-                else:
-                    results["positions"] = {
-                        "status": "skipped",
-                        "reason": "DUNE_API_KEY_CURRENT_POSITION not set"
-                    }
-                    
+                        
             except Exception as e:
                 import traceback
                 logger.error(f"Position refresh failed: {e}")
                 logger.error(traceback.format_exc())
                 results["positions"] = {"status": "error", "error": str(e)}
-
-        # ========== 3. REFRESH LIQUIDATIONS (FROM DUNE) - FIXED ==========
-        if request.refresh_liquidations and not request.prices_only:
+                results["errors"].append(f"Positions: {str(e)}")
+        
+        # ========== 3. LIQUIDATIONS - IMMEDIATE (WITH WORKING USD VALUE) ==========
+        if refresh_liquidations and not prices_only:
             logger.info("🔄 Refreshing liquidation data from Dune...")
             try:
                 dune_key = os.getenv("DUNE_API_KEY_LIQUIDATION_HISTORY")
-                if dune_key:
-                    from dune_client.client import DuneClient
-                    
+                if not dune_key:
+                    results["liquidations"] = {
+                        "status": "skipped",
+                        "reason": "DUNE_API_KEY_LIQUIDATION_HISTORY not set"
+                    }
+                else:
                     dune = DuneClient(api_key=dune_key)
+                    query_id = 5774891
                     
-                    logger.info("Calling Dune API endpoint...")
-                    
+                    rows = None
                     try:
-                        # Use query ID directly
-                        query_id = 4559847  # Your liquidation-history query ID
                         result = dune.get_latest_result(query_id)
-                        
-                        # Extract rows
                         if hasattr(result, 'get_rows'):
                             rows = result.get_rows()
                         elif hasattr(result, 'result') and hasattr(result.result, 'rows'):
                             rows = result.result.rows
-                        else:
+                        elif isinstance(result, dict):
                             rows = result.get('result', {}).get('rows', [])
-                        
-                        logger.info(f"Got {len(rows) if rows else 0} liquidation rows from Dune")
-                        
-                    except Exception as e:
-                        logger.error(f"Dune API error: {e}")
-                        try:
-                            result_df = dune.get_latest_result_dataframe(query_id)
-                            rows = result_df.to_dict('records') if result_df is not None else []
-                        except Exception as e2:
-                            logger.error(f"Dataframe method also failed: {e2}")
-                            rows = []
+                    except AttributeError:
+                        result_df = dune.get_latest_result_dataframe(query_id)
+                        if result_df is not None and not result_df.empty:
+                            rows = result_df.to_dict('records')
                     
-                    if rows:
-                        # Clear old liquidations
+                    if rows and len(rows) > 0:
                         db.query(LiquidationHistory).delete()
+                        db.commit()
                         
                         liq_count = 0
-                        for row in rows:
-                            # Calculate USD value
-                            collateral_seized = row.get('total_collateral_seized', 0) or 0
-                            liquidated_usd = 0.0
-                            
-                            if collateral_seized > 0:
-                                symbol = row.get('collateral_symbol')
-                                if symbol:
-                                    try:
-                                        price_data = price_fetcher.get_batch_prices([{
-                                            'symbol': symbol,
-                                            'address': row.get('collateral_token'),
-                                            'chain': row.get('chain')
-                                        }])
-                                        if symbol in price_data:
-                                            price = price_data[symbol].get('price', 0)
-                                            liquidated_usd = collateral_seized * price
-                                    except Exception as price_err:
-                                        logger.warning(f"Failed to get price for {symbol}: {price_err}")
-                            
-                            liquidation = LiquidationHistory(
-                                liquidation_date=pd.to_datetime(row.get('liquidation_date')) if row.get('liquidation_date') else datetime.now(timezone.utc),
-                                chain=row.get('chain'),
-                                borrower=row.get('borrower'),
-                                collateral_symbol=row.get('collateral_symbol'),
-                                debt_symbol=row.get('debt_symbol'),
-                                collateral_asset=row.get('collateral_token'),
-                                debt_asset=row.get('debt_token'),
-                                total_collateral_seized=collateral_seized,
-                                total_debt_normalized=row.get('total_debt_normalized'),
-                                liquidated_collateral_usd=liquidated_usd,
-                                liquidation_count=row.get('liquidation_count'),
-                                query_time=datetime.now(timezone.utc)
-                            )
-                            db.add(liquidation)
-                            liq_count += 1
+                        liquidations_to_price = []
                         
-                        db.commit()
-                        results["liquidations"] = {
-                            "status": "success",
-                            "count": liq_count
-                        }
-                        logger.info(f"✅ Stored {liq_count} liquidations")
+                        for row in rows:
+                            try:
+                                liquidation = LiquidationHistory(
+                                    liquidation_date=pd.to_datetime(row.get('liquidation_date')) if row.get('liquidation_date') else datetime.now(timezone.utc),
+                                    chain=row.get('chain'),
+                                    borrower=row.get('borrower'),
+                                    collateral_symbol=row.get('collateral_symbol'),
+                                    debt_symbol=row.get('debt_symbol'),
+                                    collateral_asset=row.get('collateral_token'),
+                                    debt_asset=row.get('debt_token'),
+                                    total_collateral_seized=row.get('total_collateral_seized', 0) or 0,
+                                    total_debt_normalized=row.get('total_debt_normalized'),
+                                    liquidated_collateral_usd=0,  # Will be calculated below
+                                    liquidated_debt_usd=0,  # FIX 6: Initialize debt USD field
+                                    liquidation_count=row.get('liquidation_count'),
+                                    query_time=datetime.now(timezone.utc)
+                                )
+                                db.add(liquidation)
+                                liq_count += 1
+                                liquidations_to_price.append(liquidation)
+                            except Exception as liq_error:
+                                logger.error(f"Failed to add liquidation: {liq_error}")
+                                continue
+                        
+                        if liq_count > 0:
+                            db.commit()
+                            logger.info(f"✅ Stored {liq_count} liquidations, now calculating USD values...")
+                            
+                            # ========== USD VALUE CALCULATION (FIXED VERSION) ==========
+                            # Get liquidations needing prices
+                            liquidations_to_price = db.query(LiquidationHistory).filter(
+                                LiquidationHistory.liquidated_collateral_usd == 0,
+                                LiquidationHistory.total_collateral_seized > 0
+                            ).all()
+                            
+                            # Group by (symbol, chain, address) - same format as price_fetcher uses
+                            collateral_symbol_groups = defaultdict(list)
+                            debt_symbol_groups = defaultdict(list)
+                            
+                            for liq in liquidations_to_price:
+                                if liq.collateral_symbol:
+                                    key = (liq.collateral_symbol, liq.chain, liq.collateral_asset or "")
+                                    collateral_symbol_groups[key].append(liq)
+                                
+                                if liq.debt_symbol:
+                                    key = (liq.debt_symbol, liq.chain, liq.debt_asset or "")
+                                    debt_symbol_groups[key].append(liq)
+                            
+                            logger.info(f"Need prices for {len(collateral_symbol_groups)} collateral tokens and {len(debt_symbol_groups)} debt tokens")
+                            
+                            # Build token list for batch pricing
+                            token_list = []
+                            key_to_lookup = {}  # maps price_fetcher key back to our groups
+                            
+                            # Add collateral tokens
+                            for (symbol, chain, address) in collateral_symbol_groups.keys():
+                                token_dict = {
+                                    'symbol': symbol,
+                                    'address': address if address else None,
+                                    'chain': chain
+                                }
+                                token_list.append(token_dict)
+                                
+                                # Key format that price_fetcher returns: symbol|address|chain
+                                price_key = f"{symbol}|{address or ''}|{chain or ''}"
+                                key_to_lookup[price_key] = ('collateral', symbol, chain, address)
+                            
+                            # Add debt tokens
+                            for (symbol, chain, address) in debt_symbol_groups.keys():
+                                token_dict = {
+                                    'symbol': symbol,
+                                    'address': address if address else None,
+                                    'chain': chain
+                                }
+                                token_list.append(token_dict)
+                                
+                                price_key = f"{symbol}|{address or ''}|{chain or ''}"
+                                key_to_lookup[price_key] = ('debt', symbol, chain, address)
+                            
+                            try:
+                                # Fetch all prices at once
+                                price_data = price_fetcher.get_batch_prices(token_list, progress=None)
+                                logger.info(f"Received prices for {len(price_data)} tokens")
+                                
+                                # Apply prices to liquidations
+                                updated_collateral_count = 0
+                                updated_debt_count = 0
+                                
+                                for price_key, price_value in price_data.items():
+                                    # Extract price
+                                    if isinstance(price_value, dict):
+                                        price = price_value.get('price', 0)
+                                    elif price_value is not None:
+                                        price = float(price_value)
+                                    else:
+                                        price = 0
+                                    
+                                    if price and price > 0:
+                                        # Find matching liquidations
+                                        if price_key in key_to_lookup:
+                                            asset_type, symbol, chain, address = key_to_lookup[price_key]
+                                            
+                                            if asset_type == 'collateral':
+                                                group_key = (symbol, chain, address)
+                                                if group_key in collateral_symbol_groups:
+                                                    for liq in collateral_symbol_groups[group_key]:
+                                                        liq.liquidated_collateral_usd = liq.total_collateral_seized * price
+                                                        updated_collateral_count += 1
+                                            else:  # debt
+                                                group_key = (symbol, chain, address)
+                                                if group_key in debt_symbol_groups:
+                                                    for liq in debt_symbol_groups[group_key]:
+                                                        if liq.total_debt_normalized:
+                                                            liq.liquidated_debt_usd = liq.total_debt_normalized * price
+                                                            updated_debt_count += 1
+                                
+                                db.commit()
+                                logger.info(f"✅ Updated {updated_collateral_count} collateral USD values and {updated_debt_count} debt USD values")
+                                
+                                results["liquidations"] = {
+                                    "status": "success",
+                                    "count": liq_count,
+                                    "collateral_usd_calculated": updated_collateral_count,
+                                    "debt_usd_calculated": updated_debt_count
+                                }
+                                
+                            except Exception as price_error:
+                                logger.error(f"Price calculation failed: {price_error}")
+                                # Continue without prices rather than failing completely
+                                results["liquidations"] = {
+                                    "status": "partial_success",
+                                    "count": liq_count,
+                                    "collateral_usd_calculated": 0,
+                                    "debt_usd_calculated": 0,
+                                    "price_error": str(price_error)
+                                }
                     else:
                         results["liquidations"] = {
                             "status": "success",
                             "count": 0,
                             "note": "No rows returned from Dune"
                         }
-                else:
-                    results["liquidations"] = {
-                        "status": "skipped",
-                        "reason": "DUNE_API_KEY_LIQUIDATION_HISTORY not set"
-                    }
-                    
+                        
             except Exception as e:
                 import traceback
                 logger.error(f"Liquidation refresh failed: {e}")
                 logger.error(traceback.format_exc())
                 results["liquidations"] = {"status": "error", "error": str(e)}
-                
-                
-        # ========== 4. REFRESH PRICES ONLY (FAST) ==========
-        if request.prices_only:
+                results["errors"].append(f"Liquidations: {str(e)}")
+        
+        # ========== 4. PRICES ONLY ==========
+        if prices_only:
             logger.info("🔄 Refreshing prices only...")
             try:
                 reserves = db.query(Reserve).filter(Reserve.is_active == True).all()
                 
-                from collections import defaultdict
                 reserves_by_chain = defaultdict(list)
                 for r in reserves:
                     reserves_by_chain[r.chain].append(r)
@@ -527,30 +768,34 @@ async def unified_data_refresh(
             except Exception as e:
                 logger.error(f"Price refresh failed: {e}")
                 results["prices"] = {"status": "error", "error": str(e)}
+                results["errors"].append(f"Prices: {str(e)}")
+        
+        summary = {
+            "reserves_status": results["reserves"]["status"] if results["reserves"] else "skipped",
+            "positions_updated": results["positions"]["count"] if results["positions"] and results["positions"].get("status") == "success" else 0,
+            "liquidations_updated": results["liquidations"]["count"] if results["liquidations"] and results["liquidations"].get("status") == "success" else 0,
+            "prices_updated": results["prices"]["updated"] if results["prices"] and results["prices"].get("status") == "success" else 0,
+            "has_errors": len(results["errors"]) > 0
+        }
         
         return {
-            "status": "completed",
+            "status": "completed_with_errors" if summary["has_errors"] else "completed",
+            "message": "Reserves processing in background. Other data refreshed immediately.",
             "results": results,
-            "summary": {
-                "reserves_updated": results["reserves"]["count"] if results["reserves"] and results["reserves"].get("status") == "success" else 0,
-                "positions_updated": results["positions"]["count"] if results["positions"] and results["positions"].get("status") == "success" else 0,
-                "liquidations_updated": results["liquidations"]["count"] if results["liquidations"] and results["liquidations"].get("status") == "success" else 0,
-                "prices_updated": results["prices"]["updated"] if results["prices"] and results["prices"].get("status") == "success" else 0
-            }
+            "summary": summary
         }
         
     except Exception as e:
         db.rollback()
         logger.error(f"Unified refresh failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Refresh failed: {str(e)}")
 
-@router.get("/reserves/rpc/summary")
+@router_v1.get("/reserves/rpc/summary")
 async def get_rpc_reserve_summary(db: Session = Depends(get_db)):
     """Get summary statistics of RPC reserve data"""
     try:
-        # Get latest reserves per chain
-        from sqlalchemy import case
-        
         chain_stats = db.query(
             Reserve.chain,
             func.count(Reserve.id).label('total_reserves'),
@@ -577,29 +822,37 @@ async def get_rpc_reserve_summary(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate summary: {str(e)}")
 
-# ==================== POSITION ENDPOINTS ====================
-
-# Fix 2: Positions endpoint - Group by borrower and add USD values
-@router.get("/positions")
+@router_v1.get("/positions")
 async def get_positions(
     limit: Optional[int] = 100,
     risk_category: Optional[str] = None,
     group_by_borrower: bool = False,
     db: Session = Depends(get_db)
 ):
-    """Get all positions with optional grouping by borrower"""
+    """Get all positions with optional grouping by borrower - FIXED risk_category"""
+    
+    def calculate_risk_category(health_factor: Optional[float]) -> str:
+        """Calculate risk category based on health factor"""
+        if health_factor is None:
+            return "SAFE"
+        elif health_factor < 1.0:
+            return "CRITICAL"
+        elif health_factor < 1.1:
+            return "HIGH"
+        elif health_factor < 1.5:
+            return "MEDIUM"
+        else:
+            return "SAFE"
+    
     try:
         query = db.query(Position)
         
         if risk_category:
             query = query.filter(Position.risk_category == risk_category)
         
-        positions = query.limit(limit * 2).all()  # Get more to account for grouping
+        positions = query.limit(limit * 2).all()
         
-        # In api.py, update the positions endpoint grouping section:
-
         if group_by_borrower:
-            from collections import defaultdict
             borrower_groups = defaultdict(list)
             
             for p in positions:
@@ -611,44 +864,50 @@ async def get_positions(
                 total_collateral = sum(p.total_collateral_usd or 0 for p in pos_list)
                 total_debt = sum(p.total_debt_usd or 0 for p in pos_list)
                 
-                # Calculate health factor
-                if total_debt > 0:
-                    # Has debt - use actual HF
-                    valid_hfs = [p.enhanced_health_factor for p in pos_list if p.enhanced_health_factor]
-                    min_hf = min(valid_hfs) if valid_hfs else None
-                    risk_cat = next((p.risk_category for p in pos_list if p.enhanced_health_factor == min_hf), None)
+                # Calculate health factors and risk categories
+                health_factors = []
+                for p in pos_list:
+                    if p.enhanced_health_factor and p.enhanced_health_factor < 999:
+                        health_factors.append(p.enhanced_health_factor)
+                
+                min_hf = min(health_factors) if health_factors else None
+                
+                # FIXED: Calculate risk_category properly
+                if min_hf is not None:
+                    risk_cat = calculate_risk_category(min_hf)
+                elif total_debt > 0:
+                    # If we have debt but no health factor, assume medium risk
+                    risk_cat = "MEDIUM"
                 else:
-                    # No debt - collateral only position
-                    min_hf = float('inf')  # Infinite HF (no liquidation risk)
                     risk_cat = "SAFE"
                 
                 result.append({
                     "borrower_address": pos_list[0].borrower_address,
                     "chain": pos_list[0].chain,
                     "position_count": len(pos_list),
-                    "tokens": [p.token_symbol for p in pos_list],
+                    "tokens": list(set([p.token_symbol for p in pos_list if p.token_symbol])),
                     "total_collateral_usd": round(total_collateral, 2),
                     "total_debt_usd": round(total_debt, 2),
-                    "lowest_health_factor": round(min_hf, 4) if min_hf != float('inf') else "∞",
-                    "risk_category": risk_cat,
+                    "lowest_health_factor": round(min_hf, 2) if min_hf else None,
+                    "risk_category": risk_cat,  # FIXED: Use calculated risk category
                     "position_type": "collateral_only" if total_debt == 0 else "active_borrowing",
-                    "last_updated": max(p.last_updated for p in pos_list if p.last_updated)
+                    "last_updated": max((p.last_updated for p in pos_list if p.last_updated), default=None)
                 })
             
             return result
         else:
-            # Return individual positions with USD values
+            # Individual positions
             return [
                 {
                     "borrower_address": p.borrower_address,
                     "chain": p.chain,
                     "token_symbol": p.token_symbol,
                     "collateral_amount": p.collateral_amount,
-                    "debt_amount": p.debt_amount,
+                    "debt_amount": p.debt_amount if p.debt_amount and p.debt_amount > 0 else None,
                     "collateral_usd": round(p.total_collateral_usd or 0, 2),
                     "debt_usd": round(p.total_debt_usd or 0, 2),
                     "enhanced_health_factor": p.enhanced_health_factor,
-                    "risk_category": p.risk_category,
+                    "risk_category": p.risk_category or calculate_risk_category(p.enhanced_health_factor),  # FIXED
                     "last_updated": p.last_updated
                 }
                 for p in positions[:limit]
@@ -656,44 +915,76 @@ async def get_positions(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
 
-
-@router.get("/positions/risky")
+# FIX 8: Fixed risky positions with pagination and proper filtering
+@router_v1.get("/positions/risky")
 async def get_risky_positions(
     threshold_hf: Optional[float] = 1.5,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db)
 ):
-    """Get positions with low health factors"""
+    """Get positions with low health factors - FIXED with pagination"""
     try:
+        # Get total count first
+        total_query = db.query(func.count(Position.id)).filter(
+            Position.enhanced_health_factor < threshold_hf,
+            Position.enhanced_health_factor > 0,
+            Position.total_debt_usd > 0
+        )
+        total_count = total_query.scalar()
+        
+        # Get paginated results
+        offset = (page - 1) * page_size
         positions = db.query(Position).filter(
-            Position.enhanced_health_factor < threshold_hf
-        ).order_by(Position.enhanced_health_factor).all()
+            Position.enhanced_health_factor < threshold_hf,
+            Position.enhanced_health_factor > 0,
+            Position.total_debt_usd > 0
+        ).order_by(Position.enhanced_health_factor).offset(offset).limit(page_size).all()
+        
+        total_pages = (total_count + page_size - 1) // page_size
         
         return {
             "threshold": threshold_hf,
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_items": total_count,
+                "total_pages": total_pages,
+                "has_next": page < total_pages,
+                "has_prev": page > 1
+            },
             "count": len(positions),
             "positions": [
                 {
                     "borrower_address": p.borrower_address,
                     "token_symbol": p.token_symbol,
-                    "health_factor": p.enhanced_health_factor,
-                    "collateral_usd": p.total_collateral_usd,
-                    "debt_usd": p.total_debt_usd,
-                    "risk_category": p.risk_category
+                    "health_factor": round(p.enhanced_health_factor, 2),
+                    "collateral_usd": round(p.total_collateral_usd or 0, 2),
+                    "debt_usd": round(p.total_debt_usd or 0, 2),
+                    "risk_category": safe_display(p.risk_category, "string", get_risk_category(p.enhanced_health_factor))  # FIX 3: Safe display with fallback
                 }
                 for p in positions
             ]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch risky positions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
-@router.get("/positions_summary")
-async def get_positions_summary(db: Session = Depends(get_db)):
-    """Get summarized view of borrower positions"""
+@router_v1.get("/positions_summary")
+async def get_positions_summary(
+    page: int = 1,
+    page_size: int = 100,
+    db: Session = Depends(get_db)
+):
+    """Get summarized view - PAGINATED"""
     try:
-        positions = db.query(Position).all()
-        if not positions:
+        total_count = db.query(Position).count()
+        
+        if total_count == 0:
             raise HTTPException(status_code=404, detail="No positions found")
-
+        
+        offset = (page - 1) * page_size
+        positions = db.query(Position).offset(offset).limit(page_size).all()
+        
         summary = [
             {
                 "borrower": p.borrower_address,
@@ -701,27 +992,36 @@ async def get_positions_summary(db: Session = Depends(get_db)):
                 "token_symbol": p.token_symbol,
                 "total_collateral_usd": round(p.total_collateral_usd or 0.0, 2),
                 "total_debt_usd": round(p.total_debt_usd or 0.0, 2),
-                "health_factor": round(p.health_factor or 0.0, 4),
+                "health_factor": round(p.enhanced_health_factor or 0.0, 4) if p.enhanced_health_factor and p.enhanced_health_factor < 999 else "∞",
             }
             for p in positions
         ]
-
-        return summary
-
+        
+        total_pages = (total_count + page_size - 1) // page_size
+        
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total_positions": total_count,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1,
+            "positions": summary
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+    
 # ==================== LIQUIDATION HISTORY ====================
 
-# Fix Liquidation history - Add USD values to response
-
-@router.get("/liquidation-history")
+@router_v1.get("/liquidation-history")
 async def get_liquidation_history(
     limit: Optional[int] = 100,
     chain: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Get liquidation history with USD values"""
+    """Get liquidation history with USD values - FIXED"""
     try:
         query = db.query(LiquidationHistory)
         
@@ -742,23 +1042,20 @@ async def get_liquidation_history(
                 "total_collateral_seized": round(liq.total_collateral_seized or 0, 6),
                 "total_debt_normalized": round(liq.total_debt_normalized or 0, 6),
                 "collateral_seized_usd": round(liq.liquidated_collateral_usd or 0, 2),
-                "debt_repaid_usd": round(liq.liquidated_debt_usd or 0, 2)  # Changed from total_debt_usd
+                "debt_repaid_usd": "Avail Soon" if not liq.liquidated_debt_usd or liq.liquidated_debt_usd == 0 else round(liq.liquidated_debt_usd, 2)  # FIXED
             }
             for liq in liquidations
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-            
-# ==================== DASHBOARD ====================
-
-@router.get("/protocol_risk_summary")
+    
+# FIX 9: Fixed average_health_factor calculation
+@router_v1.get("/protocol_risk_summary")
 async def get_protocol_risk_summary(
     chains: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """
-    Comprehensive protocol-level risk metrics with LT source tracking
-    """
+    """Comprehensive protocol-level risk metrics - FIXED"""
     try:
         chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
         
@@ -771,13 +1068,12 @@ async def get_protocol_risk_summary(
             return {
                 "total_collateral_usd": 0,
                 "total_debt_usd": 0,
-                "average_health_factor": 0,
+                "average_health_factor": None,
                 "at_risk_value_usd": 0,
                 "chains_analyzed": chain_filter or [],
                 "lt_coverage": {"reserve": 0, "fallback": 0, "default": 0}
             }
         
-        # Track LT sources
         lt_sources = {"reserve": 0, "fallback": 0, "default": 0}
         
         for pos in positions:
@@ -787,56 +1083,50 @@ async def get_protocol_risk_summary(
         total_collateral = sum(p.total_collateral_usd or 0 for p in positions)
         total_debt = sum(p.total_debt_usd or 0 for p in positions)
         
+        # FIX 9: Fixed average HF calculation
         valid_hfs = [p.enhanced_health_factor for p in positions 
-                     if p.enhanced_health_factor and p.enhanced_health_factor < 100]
-        avg_hf = sum(valid_hfs) / len(valid_hfs) if valid_hfs else 0
+                     if p.enhanced_health_factor and 0 < p.enhanced_health_factor < 999]
+        avg_hf = round(sum(valid_hfs) / len(valid_hfs), 2) if valid_hfs else None  # None instead of 0
         
         at_risk = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5]
         at_risk_value = sum(p.total_collateral_usd or 0 for p in at_risk)
         
-        return {
-            "total_collateral_usd": round(total_collateral, 2),
-            "total_debt_usd": round(total_debt, 2),
-            "protocol_ltv": round(total_debt / total_collateral, 4) if total_collateral > 0 else 0,
-            "average_health_factor": round(avg_hf, 3),
-            "at_risk_value_usd": round(at_risk_value, 2),
-            "at_risk_percentage": round((at_risk_value / total_collateral * 100) if total_collateral > 0 else 0, 2),
+        return round_metrics({
+            "total_collateral_usd": total_collateral,
+            "total_debt_usd": total_debt,
+            "protocol_ltv": (total_debt / total_collateral) if total_collateral > 0 else 0,
+            "average_health_factor": avg_hf,
+            "at_risk_value_usd": at_risk_value,
+            "at_risk_percentage": ((at_risk_value / total_collateral * 100) if total_collateral > 0 else 0),
             "chains_analyzed": chain_filter or list(set(p.chain for p in positions if p.chain)),
             "lt_coverage": {
                 "from_reserve_data": lt_sources['reserve'],
                 "from_fallback": lt_sources['fallback'],
                 "from_default": lt_sources['default'],
-                "reserve_coverage_pct": round((lt_sources['reserve'] / len(positions) * 100), 2)
+                "reserve_coverage_pct": (lt_sources['reserve'] / len(positions) * 100)
             },
             "timestamp": datetime.now(timezone.utc)
-        }
+        })
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-    
-# ==================== CHAIN MANAGEMENT ====================    
 
-@router.get("/chains/available")
+# ==================== CHAIN MANAGEMENT ====================
+
+@router_v1.get("/chains/available")
 async def get_available_chains(db: Session = Depends(get_db)):
     """Get chains from both reserves and positions"""
     try:
-        # Get chains from reserves
         reserve_chains = set(c[0] for c in db.query(Reserve.chain).distinct().all() if c[0])
-        
-        # Get chains from positions  
         position_chains = set(c[0] for c in db.query(Position.chain).distinct().all() if c[0])
-        
-        # Combined unique chains
         all_chains = sorted(reserve_chains | position_chains)
         
         details = []
         for chain in all_chains:
             reserve_count = db.query(Reserve).filter(Reserve.chain == chain).count()
             position_count = db.query(Position).filter(Position.chain == chain).count()
-            
             reserve_latest = db.query(func.max(Reserve.query_time)).filter(Reserve.chain == chain).scalar()
             
-            # FIX: Display "NA on reserve" instead of null
             last_reserve_display = reserve_latest if reserve_latest else "NA on reserve"
             
             details.append({
@@ -845,7 +1135,7 @@ async def get_available_chains(db: Session = Depends(get_db)):
                 "position_count": position_count,
                 "has_reserves": reserve_count > 0,
                 "has_positions": position_count > 0,
-                "last_reserve_update": last_reserve_display  # Changed from reserve_latest
+                "last_reserve_update": last_reserve_display
             })
         
         return {
@@ -857,30 +1147,24 @@ async def get_available_chains(db: Session = Depends(get_db)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-        
-# ==================== DEEP INSIGHTS ENDPOINT ====================
 
-@router.get("/insights/protocol-health")
+# ==================== DEEP INSIGHTS ====================
+
+@router_v1.get("/insights/protocol-health")
 async def get_protocol_health_insights(
-    chains: Optional[str] = None,  # "ethereum,polygon"
+    chains: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """
-    Deep protocol health insights combining Reserves, Positions, and Liquidations
-    Returns comprehensive risk analysis for frontend dashboards
-    """
+    """Deep protocol health insights - FIXED risk distribution"""
     try:
-        # Parse chains
         chain_filter = None
         if chains:
             chain_filter = [c.strip().lower() for c in chains.split(',')]
         
-        # 1. GET LATEST RESERVES DATA
         reserve_query = db.query(Reserve).filter(Reserve.is_active == True)
         if chain_filter:
             reserve_query = reserve_query.filter(Reserve.chain.in_(chain_filter))
         
-        # Get only latest per token
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
@@ -894,16 +1178,12 @@ async def get_protocol_health_insights(
             (Reserve.query_time == subq.c.max_time)
         ).all()
         
-        # 2. GET POSITIONS DATA
         position_query = db.query(Position)
         if chain_filter:
             position_query = position_query.filter(Position.chain.in_(chain_filter))
         positions = position_query.all()
         
-        # 3. GET LIQUIDATION HISTORY (last 30 days)
-        from datetime import datetime, timedelta
         thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-        
         liq_query = db.query(LiquidationHistory).filter(
             LiquidationHistory.liquidation_date >= thirty_days_ago
         )
@@ -911,12 +1191,9 @@ async def get_protocol_health_insights(
             liq_query = liq_query.filter(LiquidationHistory.chain.in_(chain_filter))
         liquidations = liq_query.all()
         
-        # 4. COMPUTE CROSS-DATA INSIGHTS
-        
-        # Reserve insights
         reserve_insights = {
             'total_reserves': len(reserves),
-            'high_apy_reserves': len([r for r in reserves if r.borrow_apy > 10]),
+            'high_apy_reserves': len([r for r in reserves if r.borrow_apy and r.borrow_apy > 10]),
             'frozen_reserves': len([r for r in reserves if r.is_frozen]),
             'avg_supply_apy': sum(r.supply_apy or 0 for r in reserves) / len(reserves) if reserves else 0,
             'avg_borrow_apy': sum(r.borrow_apy or 0 for r in reserves) / len(reserves) if reserves else 0,
@@ -925,12 +1202,29 @@ async def get_protocol_health_insights(
             'price_coverage': (sum(1 for r in reserves if (r.price_usd or 0) > 0) / len(reserves) * 100) if reserves else 0
         }
         
-        # Position insights
         risky_positions = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5]
         critical_positions = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.1]
         
         total_collateral = sum(p.total_collateral_usd or 0 for p in positions)
         total_debt = sum(p.total_debt_usd or 0 for p in positions)
+        
+        valid_hf_positions = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 100]
+        avg_hf = sum(p.enhanced_health_factor for p in valid_hf_positions) / len(valid_hf_positions) if valid_hf_positions else 0
+        
+        # FIX 10: Fixed risk distribution calculation
+        risk_distribution = {
+            'SAFE': 0,
+            'LOW_RISK': 0,
+            'MEDIUM_RISK': 0,
+            'HIGH_RISK': 0,
+            'CRITICAL': 0,
+            'LIQUIDATION_IMMINENT': 0
+        }
+
+        for p in positions:
+            category = p.risk_category or get_risk_category(p.enhanced_health_factor)
+            if category in risk_distribution:
+                risk_distribution[category] += 1
         
         position_insights = {
             'total_positions': len(positions),
@@ -939,18 +1233,10 @@ async def get_protocol_health_insights(
             'total_collateral_usd': total_collateral,
             'total_debt_usd': total_debt,
             'protocol_ltv': (total_debt / total_collateral) if total_collateral > 0 else 0,
-            'avg_health_factor': sum(p.enhanced_health_factor or 0 for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 100) / len([p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 100]) if positions else 0,
-            'risk_distribution': {
-                'SAFE': len([p for p in positions if p.risk_category == 'SAFE']),
-                'LOW_RISK': len([p for p in positions if p.risk_category == 'LOW_RISK']),
-                'MEDIUM_RISK': len([p for p in positions if p.risk_category == 'MEDIUM_RISK']),
-                'HIGH_RISK': len([p for p in positions if p.risk_category == 'HIGH_RISK']),
-                'CRITICAL': len([p for p in positions if p.risk_category == 'CRITICAL']),
-                'LIQUIDATION_IMMINENT': len([p for p in positions if p.risk_category == 'LIQUIDATION_IMMINENT'])
-            }
+            'avg_health_factor': avg_hf,
+            'risk_distribution': risk_distribution  # FIXED: Now properly calculated
         }
         
-        # Liquidation insights
         total_liquidated_value = sum(l.liquidated_collateral_usd or 0 for l in liquidations)
         
         liquidation_insights = {
@@ -962,21 +1248,15 @@ async def get_protocol_health_insights(
             'top_liquidated_assets': {}
         }
         
-        # Top liquidated assets
-        from collections import Counter
         asset_counter = Counter(l.collateral_symbol for l in liquidations if l.collateral_symbol)
         liquidation_insights['top_liquidated_assets'] = dict(asset_counter.most_common(5))
         
-        # 5. CROSS-DATA CORRELATIONS
-        
-        # Tokens at risk (appear in both risky positions and reserves)
         risky_token_symbols = set(p.token_symbol for p in risky_positions if p.token_symbol)
         reserve_token_symbols = set(r.token_symbol for r in reserves)
         tokens_at_risk = list(risky_token_symbols & reserve_token_symbols)
         
-        # Find reserve data for risky tokens
         risky_token_details = []
-        for token in tokens_at_risk[:10]:  # Top 10
+        for token in tokens_at_risk[:10]:
             reserve = next((r for r in reserves if r.token_symbol == token), None)
             position_count = len([p for p in risky_positions if p.token_symbol == token])
             
@@ -991,7 +1271,6 @@ async def get_protocol_health_insights(
                     'price_usd': reserve.price_usd
                 })
         
-        # 6. CHAIN BREAKDOWN
         chain_breakdown = {}
         for chain in (chain_filter or set(r.chain for r in reserves)):
             chain_reserves = [r for r in reserves if r.chain == chain]
@@ -1007,7 +1286,6 @@ async def get_protocol_health_insights(
                 'risky_positions': len([p for p in chain_positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5])
             }
         
-        # 7. ALERTS & WARNINGS
         alerts = []
         
         if position_insights['critical_positions'] > 10:
@@ -1042,8 +1320,7 @@ async def get_protocol_health_insights(
                 'action': 'Investigate market conditions'
             })
         
-        # 8. RETURN COMPREHENSIVE INSIGHTS
-        return {
+        return round_metrics({
             'timestamp': datetime.now(timezone.utc),
             'chains_analyzed': list(chain_filter) if chain_filter else 'all',
             'data_sources': {
@@ -1062,53 +1339,41 @@ async def get_protocol_health_insights(
                 reserve_insights,
                 liquidation_insights
             )
-        }
+        })
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate insights: {str(e)}")
-
-"""
-Replace the calculate_health_score function in api.py with this version
-Fixes division by zero errors
-"""
 
 def calculate_health_score(position_insights, reserve_insights, liquidation_insights) -> Dict[str, any]:
     """Calculate overall protocol health score (0-100) with safe division"""
     score = 100
     
     try:
-        # Safe division for critical positions
         total_pos = position_insights.get('total_positions', 0)
         if total_pos > 0:
             critical_count = position_insights.get('critical_positions', 0)
             critical_ratio = critical_count / total_pos
-            score -= critical_ratio * 40  # Max 40 point deduction
+            score -= critical_ratio * 40
         
-        # Safe LTV check
         ltv = position_insights.get('protocol_ltv', 0)
         if ltv and ltv > 0.70:
-            score -= min((ltv - 0.70) * 100, 30)  # Max 30 point deduction
+            score -= min((ltv - 0.70) * 100, 30)
         
-        # Safe liquidation rate
         liq_rate = liquidation_insights.get('liquidation_rate_per_day', 0)
         if liq_rate and liq_rate > 5:
-            score -= min((liq_rate - 5) * 2, 20)  # Max 20 point deduction
+            score -= min((liq_rate - 5) * 2, 20)
         
-        # Safe frozen reserves ratio
         total_reserves = reserve_insights.get('total_reserves', 0)
         if total_reserves and total_reserves > 0:
             frozen_count = reserve_insights.get('frozen_reserves', 0)
             frozen_ratio = frozen_count / total_reserves
-            score -= frozen_ratio * 10  # Max 10 point deduction
+            score -= frozen_ratio * 10
         
     except Exception as e:
-        # If anything fails, just return default score
-        print(f"Warning in health score calculation: {e}")
+        logger.warning(f"Warning in health score calculation: {e}")
     
-    # Clamp score between 0 and 100
     score = max(0, min(100, score))
     
-    # Determine status
     if score >= 80:
         status, color = 'HEALTHY', 'green'
     elif score >= 60:
@@ -1124,9 +1389,10 @@ def calculate_health_score(position_insights, reserve_insights, liquidation_insi
         'color': color,
         'description': f"Protocol health is {status.lower()}"
     }
+
 # ==================== STRESS TESTS ====================
 
-@router.post("/stress-test/custom")
+@router_v1.post("/stress-test/custom")
 async def run_custom_stress_test(
     price_drops: Dict[str, float],
     scenario_name: Optional[str] = "Custom Scenario",
@@ -1142,10 +1408,10 @@ async def run_custom_stress_test(
         
         for pos in positions:
             drop_pct = price_drops.get(pos.token_symbol, 0) / 100
-            stressed_collateral = pos.total_collateral_usd * (1 - drop_pct)
+            stressed_collateral = (pos.total_collateral_usd or 0) * (1 - drop_pct)
             
             if pos.total_debt_usd and pos.total_debt_usd > 0:
-                liquidation_threshold = pos.liquidation_threshold or 0.85
+                liquidation_threshold, _ = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
                 stressed_hf = (stressed_collateral * liquidation_threshold) / pos.total_debt_usd
                 
                 if stressed_hf < 1.0:
@@ -1153,7 +1419,7 @@ async def run_custom_stress_test(
                     total_value_at_risk += stressed_collateral
                     
                     results.append({
-                        "borrower": pos.borrower_address[:10] + "...",
+                        "borrower": pos.borrower_address[:10] + "..." if pos.borrower_address else "Unknown",
                         "token": pos.token_symbol,
                         "current_hf": pos.enhanced_health_factor,
                         "stressed_hf": round(stressed_hf, 3),
@@ -1161,103 +1427,28 @@ async def run_custom_stress_test(
                         "price_drop": drop_pct * 100
                     })
         
-        return {
+        return round_metrics({
             "scenario_name": scenario_name,
             "price_drops_applied": price_drops,
             "total_positions": len(positions),
             "positions_at_risk": total_at_risk,
-            "percentage_at_risk": round((total_at_risk / len(positions) * 100) if positions else 0, 2),
-            "collateral_at_risk_usd": round(total_value_at_risk, 2),
+            "percentage_at_risk": ((total_at_risk / len(positions) * 100) if positions else 0),
+            "collateral_at_risk_usd": total_value_at_risk,
             "critical_positions": sorted(results, key=lambda x: x["collateral_at_risk"], reverse=True)[:20]
-        }
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Custom stress test failed: {str(e)}")
-    
-"""
-Advanced Risk Analysis Endpoints
-Add these to your api.py file
-"""
-
-# ==================== PROTOCOL RISK SUMMARY ====================
-
-@router.get("/protocol_risk_summary")
-async def get_protocol_risk_summary(
-    chains: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """
-    Comprehensive protocol-level risk metrics with LT source tracking
-    """
-    try:
-        chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
-        
-        position_query = db.query(Position)
-        if chain_filter:
-            position_query = position_query.filter(Position.chain.in_(chain_filter))
-        positions = position_query.all()
-        
-        if not positions:
-            return {
-                "total_collateral_usd": 0,
-                "total_debt_usd": 0,
-                "average_health_factor": 0,
-                "at_risk_value_usd": 0,
-                "chains_analyzed": chain_filter or [],
-                "lt_coverage": {"reserve": 0, "fallback": 0, "default": 0}
-            }
-        
-        # Track LT sources
-        lt_sources = {"reserve": 0, "fallback": 0, "default": 0}
-        
-        for pos in positions:
-            _, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
-            lt_sources[lt_source] += 1
-        
-        total_collateral = sum(p.total_collateral_usd or 0 for p in positions)
-        total_debt = sum(p.total_debt_usd or 0 for p in positions)
-        
-        valid_hfs = [p.enhanced_health_factor for p in positions 
-                     if p.enhanced_health_factor and p.enhanced_health_factor < 100]
-        avg_hf = sum(valid_hfs) / len(valid_hfs) if valid_hfs else 0
-        
-        at_risk = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5]
-        at_risk_value = sum(p.total_collateral_usd or 0 for p in at_risk)
-        
-        return {
-            "total_collateral_usd": round(total_collateral, 2),
-            "total_debt_usd": round(total_debt, 2),
-            "protocol_ltv": round(total_debt / total_collateral, 4) if total_collateral > 0 else 0,
-            "average_health_factor": round(avg_hf, 3),
-            "at_risk_value_usd": round(at_risk_value, 2),
-            "at_risk_percentage": round((at_risk_value / total_collateral * 100) if total_collateral > 0 else 0, 2),
-            "chains_analyzed": chain_filter or list(set(p.chain for p in positions if p.chain)),
-            "lt_coverage": {
-                "from_reserve_data": lt_sources['reserve'],
-                "from_fallback": lt_sources['fallback'],
-                "from_default": lt_sources['default'],
-                "reserve_coverage_pct": round((lt_sources['reserve'] / len(positions) * 100), 2)
-            },
-            "timestamp": datetime.now(timezone.utc)
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-    
 
 # ==================== BORROWER RISK SIGNALS ====================
 
-@router.get("/borrower_risk_signals")
+@router_v1.get("/borrower_risk_signals")
 async def get_borrower_risk_signals(
     threshold: float = 1.5,
     limit: int = 50,
     db: Session = Depends(get_db)
 ):
-    """
-    Identify borrowers trending toward liquidation
-    Now with proper liquidation_threshold from Reserve JOIN + fallback
-    """
+    """Identify borrowers trending toward liquidation"""
     try:
-        # Get risky positions
         positions = db.query(Position).filter(
             Position.enhanced_health_factor < threshold,
             Position.total_debt_usd > 0
@@ -1266,13 +1457,9 @@ async def get_borrower_risk_signals(
         signals = []
         
         for pos in positions:
-            # Get liquidation threshold with fallback
             lt, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
-            
-            # Calculate current LTV
             current_ltv = (pos.total_debt_usd / pos.total_collateral_usd) if pos.total_collateral_usd else 0
             
-            # Determine urgency
             if pos.enhanced_health_factor < 1.05:
                 urgency = "CRITICAL"
             elif pos.enhanced_health_factor < 1.1:
@@ -1288,11 +1475,11 @@ async def get_borrower_risk_signals(
                 "current_health_factor": round(pos.enhanced_health_factor, 3) if pos.enhanced_health_factor else 0,
                 "borrower_ltv": round(current_ltv, 4),
                 "liquidation_threshold": lt,
-                "lt_source": lt_source,  # Shows if from reserve/fallback/default
+                "lt_source": lt_source,
                 "collateral_usd": round(pos.total_collateral_usd or 0, 2),
                 "debt_usd": round(pos.total_debt_usd or 0, 2),
                 "primary_collateral": pos.token_symbol,
-                "risk_category": pos.risk_category,
+                "risk_category": safe_display(pos.risk_category, "string", get_risk_category(pos.enhanced_health_factor)),  # FIX 3: Safe display
                 "urgency": urgency,
                 "distance_to_liquidation": round((pos.enhanced_health_factor - 1.0), 3) if pos.enhanced_health_factor else 0
             })
@@ -1307,23 +1494,18 @@ async def get_borrower_risk_signals(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
-
 # ==================== RESERVE RISK METRICS ====================
 
-@router.get("/reserve_risk_metrics")
+@router_v1.get("/reserve_risk_metrics")
 async def get_reserve_risk_metrics(
     chains: Optional[str] = None,
     min_ltv: Optional[float] = None,
     db: Session = Depends(get_db)
 ):
-    """
-    Evaluate which assets are most dangerous to system health
-    Returns: Utilization, LTV, LT, liquidation bonus, top borrower exposure
-    """
+    """Evaluate which assets are most dangerous to system health"""
     try:
         chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
         
-        # Get latest reserves only
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
@@ -1345,7 +1527,6 @@ async def get_reserve_risk_metrics(
         
         reserves = reserve_query.all()
         
-        # Get positions for exposure calculation
         position_query = db.query(Position)
         if chain_filter:
             position_query = position_query.filter(Position.chain.in_(chain_filter))
@@ -1354,45 +1535,33 @@ async def get_reserve_risk_metrics(
         metrics = []
         
         for reserve in reserves:
-            # Calculate utilization from rates
             if reserve.liquidity_rate and reserve.variable_borrow_rate:
                 utilization = reserve.variable_borrow_rate / (reserve.liquidity_rate + reserve.variable_borrow_rate)
             else:
                 utilization = 0
             
-            # Find positions using this asset
             asset_positions = [p for p in positions if p.token_symbol == reserve.token_symbol]
             total_exposure = sum(p.total_collateral_usd or 0 for p in asset_positions)
             
-            # Top borrowers for this asset
             top_borrowers = sorted(asset_positions, key=lambda x: x.total_collateral_usd or 0, reverse=True)[:3]
             
-            # Risk score (higher = more risky)
-
-            # In reserve_risk_metrics endpoint, replace risk score calculation:
-
             risk_score = 0
-
-            # Frozen reserves (but check if there's actual activity)
+            
             if reserve.is_frozen:
                 if total_exposure > 0 or len(asset_positions) > 0:
-                    risk_score += 25  # Only add if frozen WITH exposure
+                    risk_score += 25
                 else:
-                    risk_score += 10  # Lower score if frozen but no exposure
-
-            # High LTV
+                    risk_score += 10
+            
             if reserve.ltv and reserve.ltv > 0.75:
                 risk_score += 30
-
-            # High utilization
+            
             if utilization > 0.80:
                 risk_score += 25
-
-            # Low liquidation threshold
+            
             if reserve.liquidation_threshold and reserve.liquidation_threshold < 0.75:
                 risk_score += 20
-
-            # Large single borrower concentration (>50% of total exposure)
+            
             if total_exposure > 0 and top_borrowers:
                 concentration = (top_borrowers[0].total_collateral_usd or 0) / total_exposure
                 if concentration > 0.5:
@@ -1417,7 +1586,6 @@ async def get_reserve_risk_metrics(
                 "risk_level": "HIGH" if risk_score >= 50 else "MEDIUM" if risk_score >= 30 else "LOW"
             })
         
-        # Sort by risk score
         metrics.sort(key=lambda x: x['risk_score'], reverse=True)
         
         return {
@@ -1430,30 +1598,22 @@ async def get_reserve_risk_metrics(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
-
 # ==================== LIQUIDATION TRENDS ====================
 
-@router.get("/liquidation_trends")
+@router_v1.get("/liquidation_trends")
 async def get_liquidation_trends(
     days: int = 7,
     chains: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """
-    Identify liquidation patterns and predict new liquidation zones
-    Returns: 24h/7d liquidations, volume, top assets, avg HF before liquidation
-    """
+    """Identify liquidation patterns and predict new liquidation zones"""
     try:
-        from datetime import timedelta
-        from collections import Counter
-        
         chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
         
         now = datetime.now()
         cutoff_7d = now - timedelta(days=days)
         cutoff_24h = now - timedelta(days=1)
 
-        # Get liquidations
         liq_query = db.query(LiquidationHistory).filter(
             LiquidationHistory.liquidation_date >= cutoff_7d
         )
@@ -1463,23 +1623,19 @@ async def get_liquidation_trends(
         liquidations_7d = liq_query.all()
         liquidations_24h = [l for l in liquidations_7d if l.liquidation_date >= cutoff_24h]
         
-        # Calculate metrics with safe division
         total_volume_7d = sum(l.liquidated_collateral_usd or 0 for l in liquidations_7d)
         total_volume_24h = sum(l.liquidated_collateral_usd or 0 for l in liquidations_24h)
         
-        # Top liquidated assets
         asset_counter = Counter(l.collateral_symbol for l in liquidations_7d if l.collateral_symbol)
         top_assets = [
             {"asset": asset, "count": count}
             for asset, count in asset_counter.most_common(10)
         ]
         
-        # Average HF before liquidation - FIXED: Safe None handling
         hfs_before = [l.health_factor_before for l in liquidations_7d 
-                     if l.health_factor_before and l.health_factor_before < 1000]  # Reasonable upper bound
+                     if l.health_factor_before and l.health_factor_before < 1000]
         avg_hf_before = sum(hfs_before) / len(hfs_before) if hfs_before else None
         
-        # Chain distribution with safe division
         chain_counter = Counter(l.chain for l in liquidations_7d if l.chain)
         chain_distribution = [
             {
@@ -1490,7 +1646,6 @@ async def get_liquidation_trends(
             for chain, count in chain_counter.most_common()
         ]
         
-        # Trend analysis (compare 24h vs 7d average)
         daily_avg_7d = len(liquidations_7d) / days if liquidations_7d else 0
         trend = "STABLE"
         if liquidations_24h:
@@ -1512,7 +1667,6 @@ async def get_liquidation_trends(
             "timestamp": datetime.now(timezone.utc)
         }
         
-        # Only add average HF if we have valid data
         if avg_hf_before is not None:
             result["average_health_factor_before"] = round(avg_hf_before, 3)
         
@@ -1520,20 +1674,15 @@ async def get_liquidation_trends(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-    
+
 # ==================== CROSS-CHAIN RISK COMPARISON ====================
 
-@router.get("/crosschain_risk_comparison")
+@router_v1.get("/crosschain_risk_comparison")
 async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
-    """
-    Compare risk metrics across all Aave deployments
-    Returns: Avg HF per chain, debt/collateral ratio, liquidations, top tokens
-    """
+    """Compare risk metrics across all Aave deployments"""
     try:
-        # Get all positions
         positions = db.query(Position).all()
         
-        # Get all reserves
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
@@ -1547,14 +1696,11 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
             (Reserve.query_time == subq.c.max_time)
         ).filter(Reserve.is_active == True).all()
         
-        # Get liquidations (last 7 days)
-        from datetime import timedelta
         week_ago = datetime.now(timezone.utc) - timedelta(days=7)
         liquidations = db.query(LiquidationHistory).filter(
             LiquidationHistory.liquidation_date >= week_ago
         ).all()
         
-        # Group by chain
         chains = set(p.chain for p in positions if p.chain)
         
         comparison = []
@@ -1564,7 +1710,6 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
             chain_reserves = [r for r in reserves if r.chain == chain]
             chain_liqs = [l for l in liquidations if l.chain == chain]
             
-            # Calculate metrics
             valid_hfs = [p.enhanced_health_factor for p in chain_positions 
                         if p.enhanced_health_factor and p.enhanced_health_factor < 100]
             avg_hf = sum(valid_hfs) / len(valid_hfs) if valid_hfs else 0
@@ -1573,12 +1718,9 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
             total_debt = sum(p.total_debt_usd or 0 for p in chain_positions)
             debt_ratio = total_debt / total_collateral if total_collateral > 0 else 0
             
-            # Top collateral tokens
-            from collections import Counter
             token_counter = Counter(p.token_symbol for p in chain_positions if p.token_symbol)
             top_tokens = [token for token, _ in token_counter.most_common(5)]
             
-            # Reserves with LT < Avg(HF)
             risky_reserves = [r for r in chain_reserves if r.liquidation_threshold and r.liquidation_threshold < avg_hf]
             
             comparison.append({
@@ -1595,7 +1737,6 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
                 "safety_score": round((avg_hf / debt_ratio) if debt_ratio > 0 else 100, 2)
             })
         
-        # Sort by safety score (descending)
         comparison.sort(key=lambda x: x['safety_score'], reverse=True)
         
         return {
@@ -1609,22 +1750,18 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
-
 # ==================== RISK ALERTS FEED ====================
 
-@router.get("/risk_alerts_feed")
+@router_v1.get("/risk_alerts_feed")
 async def get_risk_alerts_feed(
     severity: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db)
 ):
-    """
-    Real-time risk alert feed with proper LT handling
-    """
+    """Real-time risk alert feed with proper LT handling"""
     try:
         alerts = []
         
-        # 1. Critical Health Factor Alerts (unchanged)
         critical_positions = db.query(Position).filter(
             Position.enhanced_health_factor < 1.05,
             Position.enhanced_health_factor > 0
@@ -1645,18 +1782,16 @@ async def get_risk_alerts_feed(
                 "timestamp": datetime.now(timezone.utc)
             })
         
-        # 2. Near Margin Call Alerts (UPDATED with LT lookup)
         positions = db.query(Position).filter(
             Position.total_debt_usd > 0,
             Position.total_collateral_usd > 0
         ).all()
         
         for pos in positions:
-            # Get liquidation threshold with fallback
             lt, lt_source = get_liquidation_threshold(db, pos.chain, pos.token_symbol)
             
             current_ltv = (pos.total_debt_usd / pos.total_collateral_usd) if pos.total_collateral_usd else 0
-            ltv_threshold = lt * 0.9  # 90% of liquidation threshold
+            ltv_threshold = lt * 0.9
             
             if current_ltv > ltv_threshold:
                 alerts.append({
@@ -1674,7 +1809,6 @@ async def get_risk_alerts_feed(
                     "timestamp": datetime.now(timezone.utc)
                 })
         
-        # 3. Liquidity Squeeze Alerts (unchanged)
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
@@ -1705,16 +1839,13 @@ async def get_risk_alerts_feed(
                         "timestamp": datetime.now(timezone.utc)
                     })
         
-        # Filter by severity if specified
         if severity:
             alerts = [a for a in alerts if a['severity'] == severity.upper()]
         
-        # Sort by severity and limit
         severity_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
         alerts.sort(key=lambda x: severity_order.get(x['severity'], 4))
         alerts = alerts[:limit]
         
-        # Count by severity
         severity_counts = {}
         for alert in alerts:
             sev = alert['severity']
@@ -1729,261 +1860,1345 @@ async def get_risk_alerts_feed(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-    
-# ==================== AVAILABLE CHAINS ENDPOINT ====================
 
-@router.get("/chains/available")
-async def get_available_chains(db: Session = Depends(get_db)):
-    """Get list of chains with data for dropdown menus"""
+# FIX 11: Fixed /protocol/risky-borrowers
+@router_v1.get("/protocol/risky-borrowers")
+async def get_risky_borrowers_summary(
+    threshold: float = 1.5,
+    chains: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Get count of risky borrowers - FIXED"""
     try:
-        chains = db.query(Reserve.chain).distinct().all()
-        chain_list = [c[0] for c in chains if c[0]]
+        query = db.query(Position).filter(
+            Position.enhanced_health_factor < threshold,
+            Position.enhanced_health_factor > 0,
+            Position.total_debt_usd > 0  # Must have debt
+        )
         
-        chain_details = []
-        for chain in chain_list:
-            count = db.query(Reserve).filter(Reserve.chain == chain).count()
-            latest = db.query(func.max(Reserve.query_time)).filter(Reserve.chain == chain).scalar()
+        if chains:
+            chain_list = [c.strip().lower() for c in chains.split(',')]
+            query = query.filter(Position.chain.in_(chain_list))
+        
+        risky_positions = query.all()
+        
+        by_chain = {}
+        for pos in risky_positions:
+            chain = pos.chain
+            if chain not in by_chain:
+                by_chain[chain] = {
+                    'count': 0,
+                    'critical_count': 0,
+                    'total_at_risk_usd': 0
+                }
             
-            chain_details.append({
-                "chain": chain,
-                "reserve_count": count,
-                "last_updated": latest 
-            })
+            by_chain[chain]['count'] += 1
+            if pos.enhanced_health_factor < 1.1:
+                by_chain[chain]['critical_count'] += 1
+            by_chain[chain]['total_at_risk_usd'] += round(pos.total_collateral_usd or 0, 2)
         
         return {
-            "chains": sorted(chain_list),
-            "count": len(chain_list),
-            "details": chain_details
+            "threshold": threshold,
+            "total_risky_borrowers": len(risky_positions),
+            "breakdown_by_chain": by_chain,
+            "summary_message": f"⚠️ {len(risky_positions)} addresses below {threshold} HF across {len(by_chain)} chains"
         }
+        
     except Exception as e:
+        logger.error(f"Risky borrowers error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/debug/rpc-test")
-async def test_rpc_connection():
-    """Test if RPC endpoints are accessible"""
-    from web3 import Web3
+@router_v1.get("/startup-status")
+def startup_status():
+    """Check API startup status - FIXED"""
+    DB_AVAILABLE = os.getenv("DATABASE_URL") is not None
     
-    rpcs = {
-        "ethereum": os.getenv("ETHEREUM_RPC_URL", "https://eth.llamarpc.com"),
-        "polygon": os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com"),
-        "arbitrum": os.getenv("ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc"),
-    }
+    if not DB_AVAILABLE:
+        return {
+            "api_loaded": True,
+            "database_connected": False,
+            "error": "PostgreSQL not running",
+            "message": "Start PostgreSQL or set DATABASE_URL"
+        }
     
-    results = {}
-    for chain, url in rpcs.items():
-        try:
-            w3 = Web3(Web3.HTTPProvider(url))
-            connected = w3.is_connected()
-            block = w3.eth.block_number if connected else 0
-            results[chain] = {
-                "url": url,
-                "connected": connected,
-                "latest_block": block
-            }
-        except Exception as e:
-            results[chain] = {
-                "url": url,
-                "connected": False,
-                "error": str(e)
-            }
-    
-    return results
-
-    """
-Add this to your api.py to show data freshness and cache status
-Insert after the /startup-status equivalent endpoint
-"""
-
-@router.get("/data/status")
-async def get_data_status(db: Session = Depends(get_db)):
-    """
-    Check data availability and freshness
-    Shows if database has data and how old it is
-    """
     try:
-        from datetime import timedelta
+        from .scheduler import unified_scheduler
+        scheduler_running = unified_scheduler.scheduler.running  # FIXED
+    except:
+        scheduler_running = False
+    
+    try:
+        db = SessionLocal()
+        reserve_count = db.query(Reserve).count()
+        position_count = db.query(Position).count()
+        db.close()
+        db_connected = True
+    except Exception as e:
+        reserve_count = 0
+        position_count = 0
+        db_connected = False
+    
+    return {
+        "api_loaded": True,
+        "scheduler_running": scheduler_running,
+        "database_connected": db_connected,
+        "data_counts": {
+            "reserves": reserve_count,
+            "positions": position_count
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "port": os.getenv("PORT", "8080"),
+        "database_url_set": bool(os.getenv("DATABASE_URL")),
+        "services_initialized": portfolio_service is not None
+    }
+
+@router_v1.get("/debug/test-prices")
+async def test_price_fetch(symbols: str = "WETH,USDC,WBTC"):
+    """Test price fetching directly"""
+    
+    settings = get_settings()
+    price_fetcher = EnhancedPriceFetcher(
+        api_key=getattr(settings, 'COINGECKO_API_KEY', None)
+    )
+    
+    symbol_list = symbols.split(',')
+    tokens = [
+        {'symbol': s.strip(), 'address': None, 'chain': 'ethereum'}
+        for s in symbol_list
+    ]
+    
+    try:
+        prices = price_fetcher.get_batch_prices(tokens)
+        return {
+            "requested": symbol_list,
+            "received": len(prices),
+            "prices": prices,
+            "api_key_set": bool(getattr(settings, 'COINGECKO_API_KEY', None))
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "api_key_set": bool(getattr(settings, 'COINGECKO_API_KEY', None))
+        }
+    
+# ==================== V2 USER MANAGEMENT ====================
+
+@router_v2.post("/users/register")
+async def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
+    """Register a new user for alert notifications"""
+    try:
+        existing = db.query(User).filter(User.username == user_data.username).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already exists")
         
-        now = datetime.now(timezone.utc)
-        status = {
-            "timestamp": now.isoformat(),
-            "database_connected": True,
-            "data_available": False,
-            "data_age_status": "unknown",
-            "sources": {}
+        if user_data.email:
+            email_exists = db.query(User).filter(User.email == user_data.email).first()
+            if email_exists:
+                raise HTTPException(status_code=400, detail="Email already registered")
+        
+        user = User(
+            username=user_data.username,
+            email=user_data.email,
+            telegram_chat_id=user_data.telegram_chat_id,
+            slack_webhook_url=user_data.slack_webhook_url,
+            created_at=datetime.now(timezone.utc)
+        )
+        
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        
+        return {
+            "user_id": user.id,
+            "username": user.username,
+            "message": "User registered successfully",
+            "next_steps": f"Create alert subscription at /api/v2/users/{user.id}/alerts/subscribe"
         }
         
-        # Check reserves
-        reserve_count = db.query(Reserve).count()
-        latest_reserve = db.query(Reserve).order_by(Reserve.query_time.desc()).first()
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@router_v2.get("/users/{user_id}")
+async def get_user(user_id: int, db: Session = Depends(get_db)):
+    """Get user details"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "user_id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "telegram_chat_id": user.telegram_chat_id,
+        "has_slack": bool(user.slack_webhook_url),
+        "is_active": user.is_active,
+        "created_at": user.created_at,
+        "monitored_addresses_count": len(user.monitored_addresses),
+        "alert_subscriptions_count": len(user.alert_subscriptions)
+    }
+
+@router_v2.post("/users/{user_id}/alerts/subscribe")
+async def create_alert_subscription(
+    user_id: int,
+    subscription_data: AlertSubscriptionCreate,
+    db: Session = Depends(get_db)
+):
+    """Create alert subscription for user"""
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
         
-        if latest_reserve:
-            age = now - latest_reserve.query_time.replace(tzinfo=timezone.utc)
-            age_hours = age.total_seconds() / 3600
-            
-            if age_hours < 6:
-                reserve_status = "fresh"
-            elif age_hours < 24:
-                reserve_status = "recent"
-            elif age_hours < 168:  # 1 week
-                reserve_status = "stale"
-            else:
-                reserve_status = "very_old"
-            
-            status["sources"]["reserves"] = {
-                "count": reserve_count,
-                "latest_update": latest_reserve.query_time.isoformat(),
-                "age_hours": round(age_hours, 2),
-                "status": reserve_status,
-                "chains": db.query(Reserve.chain).distinct().count()
-            }
-        else:
-            status["sources"]["reserves"] = {
-                "count": 0,
-                "status": "no_data",
-                "message": "⚠️ No reserve data - run /api/data/refresh"
-            }
+        if subscription_data.channel_email and not user.email:
+            raise HTTPException(status_code=400, detail="Email not configured for user")
         
-        # Check positions
-        position_count = db.query(Position).count()
-        latest_position = db.query(Position).order_by(Position.last_updated.desc()).first()
+        if subscription_data.channel_telegram and not user.telegram_chat_id:
+            raise HTTPException(status_code=400, detail="Telegram not configured for user")
         
-        if latest_position:
-            age = now - latest_position.last_updated.replace(tzinfo=timezone.utc)
-            age_hours = age.total_seconds() / 3600
-            
-            if age_hours < 6:
-                position_status = "fresh"
-            elif age_hours < 24:
-                position_status = "recent"
-            elif age_hours < 168:
-                position_status = "stale"
-            else:
-                position_status = "very_old"
-            
-            status["sources"]["positions"] = {
-                "count": position_count,
-                "latest_update": latest_position.last_updated.isoformat(),
-                "age_hours": round(age_hours, 2),
-                "status": position_status,
-                "at_risk": db.query(Position).filter(
-                    Position.enhanced_health_factor < 1.5
-                ).count()
-            }
-        else:
-            status["sources"]["positions"] = {
-                "count": 0,
-                "status": "no_data",
-                "message": "⚠️ No position data - run /api/data/refresh"
-            }
+        if subscription_data.channel_slack and not user.slack_webhook_url:
+            raise HTTPException(status_code=400, detail="Slack not configured for user")
         
-        # Check liquidations
-        liq_count = db.query(LiquidationHistory).count()
-        latest_liq = db.query(LiquidationHistory).order_by(
-            LiquidationHistory.liquidation_date.desc()
+        subscription = AlertSubscription(
+            user_id=user_id,
+            channel_email=subscription_data.channel_email,
+            channel_telegram=subscription_data.channel_telegram,
+            channel_slack=subscription_data.channel_slack,
+            health_factor_threshold=subscription_data.health_factor_threshold,
+            ltv_threshold=subscription_data.ltv_threshold,
+            alert_frequency_hours=subscription_data.alert_frequency_hours,
+            monitored_chains=subscription_data.monitored_chains,
+            minimum_risk_level=subscription_data.minimum_risk_level,
+            created_at=datetime.now(timezone.utc)
+        )
+        
+        db.add(subscription)
+        db.commit()
+        db.refresh(subscription)
+        
+        return {
+            "subscription_id": subscription.id,
+            "user_id": user_id,
+            "channels_enabled": {
+                "email": subscription.channel_email,
+                "telegram": subscription.channel_telegram,
+                "slack": subscription.channel_slack
+            },
+            "thresholds": {
+                "health_factor": subscription.health_factor_threshold,
+                "ltv": subscription.ltv_threshold
+            },
+            "message": "Alert subscription created successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Subscription failed: {str(e)}")
+
+@router_v2.post("/users/{user_id}/monitored-addresses")
+async def add_monitored_address(
+    user_id: int,
+    address_data: MonitoredAddressCreate,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None
+):
+    """Add wallet address to monitor"""
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        existing = db.query(MonitoredAddress).filter(
+            MonitoredAddress.user_id == user_id,
+            MonitoredAddress.wallet_address == address_data.wallet_address.lower()
         ).first()
         
-        if latest_liq:
-            # For liquidations, check the actual event date, not query time
-            age = now - latest_liq.liquidation_date.replace(tzinfo=timezone.utc)
-            age_days = age.total_seconds() / 86400
-            
-            status["sources"]["liquidations"] = {
-                "count": liq_count,
-                "latest_event": latest_liq.liquidation_date.isoformat(),
-                "age_days": round(age_days, 2),
-                "status": "recent" if age_days < 7 else "older",
-                "last_30_days": db.query(LiquidationHistory).filter(
-                    LiquidationHistory.liquidation_date >= now - timedelta(days=30)
-                ).count()
-            }
-        else:
-            status["sources"]["liquidations"] = {
-                "count": 0,
-                "status": "no_data",
-                "message": "⚠️ No liquidation data"
-            }
+        if existing:
+            raise HTTPException(status_code=400, detail="Address already monitored")
         
-        # Overall status
-        has_reserves = reserve_count > 0
-        has_positions = position_count > 0
+        monitored = MonitoredAddress(
+            user_id=user_id,
+            wallet_address=address_data.wallet_address.lower(),
+            label=address_data.label,
+            custom_hf_threshold=address_data.custom_hf_threshold,
+            notify_on_all_changes=address_data.notify_on_all_changes,
+            added_at=datetime.now(timezone.utc)
+        )
         
-        if has_reserves and has_positions:
-            status["data_available"] = True
-            
-            # Determine overall age status
-            reserve_age = status["sources"]["reserves"].get("age_hours", 999)
-            position_age = status["sources"]["positions"].get("age_hours", 999)
-            oldest_age = max(reserve_age, position_age)
-            
-            if oldest_age < 6:
-                status["data_age_status"] = "fresh"
-                status["recommendation"] = "✅ Data is up to date"
-            elif oldest_age < 24:
-                status["data_age_status"] = "recent"
-                status["recommendation"] = "Data is reasonably fresh"
-            else:
-                status["data_age_status"] = "stale"
-                status["recommendation"] = "⚠️ Consider refreshing data at /api/data/refresh"
-        else:
-            status["data_available"] = False
-            status["data_age_status"] = "no_data"
-            status["recommendation"] = "❌ No data found - POST to /api/data/refresh to populate"
+        db.add(monitored)
+        db.commit()
+        db.refresh(monitored)
         
-        return status
-        
-    except Exception as e:
         return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "database_connected": False,
-            "error": str(e),
-            "recommendation": "Check database connection"
+            "monitored_address_id": monitored.id,
+            "wallet_address": monitored.wallet_address,
+            "label": monitored.label,
+            "message": "Address added to monitoring"
         }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to add address: {str(e)}")
+
+"""
+FINAL FIXES for Remaining Issues
+Apply these changes to your consolidated_api.py
+"""
+
+# ============================================================
+# FIX 1: Position endpoint - debt_amount showing 0 and risk_category
+# Replace the positions endpoint response section
+# ============================================================
+
+@router_v1.get("/positions")
+async def get_positions(
+    limit: Optional[int] = 100,
+    risk_category: Optional[str] = None,
+    group_by_borrower: bool = False,
+    db: Session = Depends(get_db)
+):
+    """Get all positions with optional grouping by borrower - FIXED"""
+    try:
+        query = db.query(Position)
+        
+        if risk_category:
+            query = query.filter(Position.risk_category == risk_category)
+        
+        positions = query.limit(limit * 2).all()
+        
+        if group_by_borrower:
+            borrower_groups = defaultdict(list)
+            
+            for p in positions:
+                key = f"{p.borrower_address}_{p.chain}"
+                borrower_groups[key].append(p)
+            
+            result = []
+            for key, pos_list in list(borrower_groups.items())[:limit]:
+                total_collateral = sum(p.total_collateral_usd or 0 for p in pos_list)
+                total_debt = sum(p.total_debt_usd or 0 for p in pos_list)
+                
+                if total_debt > 0:
+                    valid_hfs = [p.enhanced_health_factor for p in pos_list 
+                                if p.enhanced_health_factor and p.enhanced_health_factor < 999]
+                    min_hf = min(valid_hfs) if valid_hfs else None
+                    risk_cat = next((p.risk_category for p in pos_list 
+                                   if p.enhanced_health_factor == min_hf), "SAFE")
+                else:
+                    min_hf = None
+                    risk_cat = "SAFE"
+                
+                result.append({
+                    "borrower_address": pos_list[0].borrower_address,
+                    "chain": pos_list[0].chain,
+                    "position_count": len(pos_list),
+                    "tokens": [p.token_symbol for p in pos_list],
+                    "total_collateral_usd": round(total_collateral, 2),
+                    "total_debt_usd": round(total_debt, 2),
+                    "lowest_health_factor": round(min_hf, 2) if min_hf else None,
+                    "risk_category": risk_cat,
+                    "position_type": "collateral_only" if total_debt == 0 else "active_borrowing",
+                    "last_updated": max((p.last_updated for p in pos_list if p.last_updated), default=None)
+                })
+            
+            return result
+        else:
+            # FIXED: Don't show debt_amount if it's 0, and calculate risk_category
+            return [
+                {
+                    "borrower_address": p.borrower_address,
+                    "chain": p.chain,
+                    "token_symbol": p.token_symbol,
+                    "collateral_amount": p.collateral_amount,
+                    "debt_amount": p.debt_amount if p.debt_amount and p.debt_amount > 0 else "None",  # FIXED
+                    "collateral_usd": round(p.total_collateral_usd or 0, 2),
+                    "debt_usd": round(p.total_debt_usd or 0, 2),
+                    "enhanced_health_factor": p.enhanced_health_factor,
+                    "risk_category": p.risk_category or get_risk_category(p.enhanced_health_factor),  # FIXED: Calculate if null
+                    "last_updated": p.last_updated
+                }
+                for p in positions[:limit]
+            ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
 
 
-@router.get("/data/quick-stats")
-async def get_quick_stats(db: Session = Depends(get_db)):
+@router_v1.get("/liquidation-history")
+async def get_liquidation_history(
+    limit: Optional[int] = 100,
+    chain: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Get liquidation history with USD values - FIXED"""
+    try:
+        query = db.query(LiquidationHistory)
+        
+        if chain:
+            query = query.filter(LiquidationHistory.chain == chain)
+        
+        liquidations = query.order_by(
+            LiquidationHistory.liquidation_date.desc()
+        ).limit(limit).all()
+        
+        return [
+            {
+                "id": liq.id,
+                "liquidation_date": liq.liquidation_date,
+                "chain": liq.chain,
+                "collateral_symbol": liq.collateral_symbol,
+                "debt_symbol": liq.debt_symbol,
+                "total_collateral_seized": round(liq.total_collateral_seized or 0, 6),
+                "total_debt_normalized": round(liq.total_debt_normalized or 0, 6),
+                "collateral_seized_usd": round(liq.liquidated_collateral_usd or 0, 2),
+                "debt_repaid_usd": "Avail Soon" if not liq.liquidated_debt_usd or liq.liquidated_debt_usd == 0 else round(liq.liquidated_debt_usd, 2)  # FIXED
+            }
+            for liq in liquidations
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
+
+# ============================================================
+# COMPLETE UPDATED VIEW_PORTFOLIO ENDPOINT WITH ALL FIXES
+# ============================================================
+
+@router_v2.post("/portfolio/view-fast")
+async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(get_db)):
     """
-    Quick dashboard stats - minimal query overhead
+    Fast portfolio view - ONLY account data, NO asset breakdown
+    
+    Returns in ~2-3 seconds instead of 40+ seconds
+    Perfect for dashboards that only need totals and health factor
     """
     try:
-        # Single queries for counts
-        reserve_count = db.query(func.count(Reserve.id)).scalar()
-        position_count = db.query(func.count(Position.id)).scalar()
-        liq_count = db.query(func.count(LiquidationHistory.id)).scalar()
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
         
-        # At-risk positions count
-        at_risk = db.query(func.count(Position.id)).filter(
-            Position.enhanced_health_factor < 1.5,
-            Position.enhanced_health_factor > 0
-        ).scalar()
+        wallet_address = request.wallet_address
+        chains = request.chains or ['ethereum']
         
-        # Critical positions
-        critical = db.query(func.count(Position.id)).filter(
-            Position.enhanced_health_factor < 1.1,
-            Position.enhanced_health_factor > 0
-        ).scalar()
+        logger.info(f"⚡ Fast fetch for {wallet_address}")
         
-        # Total value locked (approximate)
-        total_collateral = db.query(
-            func.sum(Position.total_collateral_usd)
-        ).scalar() or 0
+        start_time = time.time()  # This should work now with the import
         
-        total_debt = db.query(
-            func.sum(Position.total_debt_usd)
-        ).scalar() or 0
+        # Get only account data (no asset breakdown)
+        chain_details = {}
+        total_collateral = 0.0
+        total_debt = 0.0
+        total_available_borrows = 0.0
+        total_net_worth = 0.0
+        lowest_hf = None
+        active_chains = []
+        
+        for chain in chains:
+            try:
+                from web3 import Web3
+                w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+                
+                if not w3.is_connected():
+                    continue
+                
+                # Get ONLY account data - skip asset breakdown completely
+                account_data = portfolio_service.get_comprehensive_account_data(
+                    w3, chain, wallet_address
+                )
+                
+                if not account_data:
+                    continue
+                
+                has_positions = (
+                    account_data.get('total_collateral_usd', 0) > 0 or
+                    account_data.get('total_debt_usd', 0) > 0
+                )
+                
+                if has_positions:
+                    active_chains.append(chain)
+                    total_collateral += account_data['total_collateral_usd']
+                    total_debt += account_data['total_debt_usd']
+                    total_available_borrows += account_data['available_borrows_usd']
+                    total_net_worth += account_data['net_worth_usd']
+                    
+                    chain_hf = account_data['health_factor']
+                    if chain_hf is not None and chain_hf != float('inf'):
+                        if lowest_hf is None or chain_hf < lowest_hf:
+                            lowest_hf = chain_hf
+                
+                # Make account_data JSON serializable
+                serializable_account_data = {
+                    'total_collateral_usd': round(account_data.get('total_collateral_usd', 0), 2),
+                    'total_debt_usd': round(account_data.get('total_debt_usd', 0), 2),
+                    'available_borrows_usd': round(account_data.get('available_borrows_usd', 0), 2),
+                    'current_liquidation_threshold': round(account_data.get('current_liquidation_threshold', 0), 4),
+                    'ltv': round(account_data.get('ltv', 0), 4),
+                    'health_factor': (
+                        round(chain_hf, 3) 
+                        if chain_hf is not None and chain_hf != float('inf') 
+                        else None
+                    ),
+                    'net_worth_usd': round(account_data.get('net_worth_usd', 0), 2),
+                    'risk_level': account_data.get('risk_level', 'NO_POSITIONS'),
+                    'liquidation_imminent': account_data.get('liquidation_imminent', False)
+                }
+                
+                chain_details[chain] = {
+                    "has_positions": has_positions,
+                    "account_data": serializable_account_data,
+                    "note": "Asset breakdown not included for faster response"
+                }
+                
+            except Exception as e:
+                logger.error(f"Error fetching {chain}: {e}")
+                continue
+        
+        # Calculate metrics
+        utilization_ratio = (total_debt / total_collateral * 100) if total_collateral > 0 else 0.0
+        
+        total_metrics = {
+            'total_collateral_usd': round(total_collateral, 2),
+            'total_debt_usd': round(total_debt, 2),
+            'total_available_borrows_usd': round(total_available_borrows, 2),
+            'total_net_worth_usd': round(total_net_worth, 2),
+            'lowest_health_factor': round(lowest_hf, 3) if lowest_hf is not None else None,
+            'utilization_ratio_percent': round(utilization_ratio, 2),
+        }
+        
+        # Risk assessment
+        if lowest_hf is None or total_collateral == 0:
+            risk_assessment = {
+                'overall_risk_level': 'NO_POSITIONS',
+                'risk_score': 0,
+                'liquidation_imminent': False,
+                'health_factor_status': 'NO_POSITIONS'
+            }
+        elif lowest_hf < 1.0:
+            risk_assessment = {
+                'overall_risk_level': 'CRITICAL',
+                'risk_score': 100,
+                'liquidation_imminent': True,
+                'health_factor_status': 'CRITICAL'
+            }
+        elif lowest_hf < 1.5:
+            risk_assessment = {
+                'overall_risk_level': 'MEDIUM',
+                'risk_score': 50,
+                'liquidation_imminent': False,
+                'health_factor_status': 'WARNING'
+            }
+        else:
+            risk_assessment = {
+                'overall_risk_level': 'LOW',
+                'risk_score': 20,
+                'liquidation_imminent': False,
+                'health_factor_status': 'HEALTHY'
+            }
+        
+        elapsed = time.time() - start_time
+        
+        response = {
+            "wallet_address": wallet_address.lower(),
+            "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
+            "fetch_time_seconds": round(elapsed, 2),
+            "active_chains": active_chains,
+            "total_metrics": total_metrics,
+            "risk_assessment": risk_assessment,
+            "chain_details": chain_details,
+            "mode": "fast",
+            "note": "Asset breakdown not included. Use /portfolio/view for detailed breakdown."
+        }
+        
+        logger.info(f"⚡ Fast fetch completed in {elapsed:.2f}s")
+        return response
+        
+    except Exception as e:
+        logger.error(f"Fast portfolio error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Fast fetch failed: {str(e)}")
+# ============================================================
+# FIX 3: Add comparison endpoint
+# ============================================================
+
+@router_v2.post("/portfolio/compare")
+async def compare_wallets(
+    wallet_addresses: List[str] = Query(..., description="List of wallet addresses to compare"),
+    chain: str = Query("ethereum", description="Chain to compare on"),
+    db: Session = Depends(get_db)
+):
+    """
+    Compare multiple wallets side-by-side
+    Fast comparison using account data only
+    """
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        if len(wallet_addresses) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 wallets per comparison")
+        
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+        
+        if not w3.is_connected():
+            raise HTTPException(status_code=503, detail=f"RPC not connected for {chain}")
+        
+        comparisons = []
+        
+        for wallet in wallet_addresses:
+            try:
+                account_data = portfolio_service.get_comprehensive_account_data(
+                    w3, chain, wallet
+                )
+                
+                if account_data:
+                    comparisons.append({
+                        "wallet_address": wallet.lower(),
+                        "collateral_usd": round(account_data['total_collateral_usd'], 2),
+                        "debt_usd": round(account_data['total_debt_usd'], 2),
+                        "health_factor": round(account_data['health_factor'], 2) if account_data['health_factor'] and account_data['health_factor'] < 999 else "∞",
+                        "ltv": round(account_data['ltv'], 4),
+                        "liquidation_threshold": round(account_data['current_liquidation_threshold'], 4),
+                        "net_worth_usd": round(account_data['net_worth_usd'], 2),
+                        "risk_level": account_data['risk_level']
+                    })
+                else:
+                    comparisons.append({
+                        "wallet_address": wallet.lower(),
+                        "collateral_usd": 0,
+                        "debt_usd": 0,
+                        "health_factor": None,
+                        "ltv": 0,
+                        "liquidation_threshold": 0,
+                        "net_worth_usd": 0,
+                        "risk_level": "NO_POSITIONS"
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error comparing {wallet}: {e}")
+                comparisons.append({
+                    "wallet_address": wallet.lower(),
+                    "error": str(e)
+                })
+        
+        # Sort by net worth
+        comparisons_with_values = [c for c in comparisons if 'net_worth_usd' in c]
+        comparisons_with_values.sort(key=lambda x: x['net_worth_usd'], reverse=True)
         
         return {
-            "reserves": reserve_count,
-            "positions": position_count,
-            "liquidations_history": liq_count,
-            "at_risk_positions": at_risk,
-            "critical_positions": critical,
-            "total_collateral_usd": round(total_collateral, 2),
-            "total_debt_usd": round(total_debt, 2),
-            "protocol_ltv": round(total_debt / total_collateral, 4) if total_collateral > 0 else 0,
-            "has_data": reserve_count > 0 or position_count > 0,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "chain": chain,
+            "wallets_compared": len(wallet_addresses),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "comparisons": comparisons_with_values
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")
+        
+# FIX 12: Add get_asset_details endpoint
+@router_v2.post("/portfolio/view")
+async def view_portfolio(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """View detailed portfolio for any wallet address - FIXED"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        # Get portfolio data from service
+        portfolio = portfolio_service.get_user_portfolio(
+            wallet_address=request.wallet_address,
+            chains=request.chains
+        )
+        
+        # CRITICAL FIX: The service returns 'chain_details' not 'portfolio_data'
+        chain_details = portfolio.get('chain_details', {})
+        
+        # Format chain details with separated collateral and debt
+        formatted_chain_details = {}
+        for chain_name, chain_data in chain_details.items():
+            # Get collateral and debt assets from the chain data
+            collateral_assets = chain_data.get('collateral_assets', [])
+            debt_assets = chain_data.get('debt_assets', [])
+            
+            formatted_chain_details[chain_name] = {
+                "has_positions": chain_data.get('has_positions', False),
+                "account_data": chain_data.get('account_data', {}),
+                "collateral_assets": collateral_assets,
+                "debt_assets": debt_assets,
+                "summary": chain_data.get('summary', {
+                    'total_collateral_assets': len(collateral_assets),
+                    'total_debt_assets': len(debt_assets)
+                })
+            }
+        
+        # Get active chains
+        active_chains = portfolio.get('active_chains', [])
+        
+        # Build response with proper structure
+        response = {
+            "wallet_address": portfolio.get('wallet_address', request.wallet_address),
+            "fetch_timestamp": portfolio.get('fetch_timestamp', datetime.now(timezone.utc).isoformat()),
+            "active_chains": active_chains,
+            "total_metrics": portfolio.get('total_metrics', {
+                'total_collateral_usd': 0.0,
+                'total_debt_usd': 0.0,
+                'total_available_borrows_usd': 0.0,
+                'total_net_worth_usd': 0.0,
+                'lowest_health_factor': None,
+                'utilization_ratio_percent': 0.0
+            }),
+            "risk_assessment": portfolio.get('risk_assessment', {
+                'overall_risk_level': 'NO_POSITIONS',
+                'risk_score': 0,
+                'liquidation_imminent': False,
+                'health_factor_status': 'NO_POSITIONS'
+            }),
+            "chain_details": formatted_chain_details
+        }
+        
+        # Apply rounding to all metrics
+        return round_metrics(response)
+        
+    except Exception as e:
+        logger.error(f"Portfolio endpoint error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Portfolio fetch failed: {str(e)}"
+        )
+
+
+@router_v2.get("/users/{user_id}/alerts/history")
+async def get_alert_history(
+    user_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get alert history for a user"""
+    alerts = db.query(AlertHistory).filter(
+        AlertHistory.user_id == user_id
+    ).order_by(AlertHistory.created_at.desc()).limit(limit).all()
+    
+    return {
+        "user_id": user_id,
+        "total_alerts": len(alerts),
+        "alerts": [
+            {
+                "alert_id": alert.id,
+                "alert_type": alert.alert_type,
+                "severity": alert.severity,
+                "message": alert.message,
+                "wallet_address": alert.wallet_address,
+                "chain": alert.chain,
+                "delivered_via": {
+                    "email": alert.sent_via_email,
+                    "telegram": alert.sent_via_telegram,
+                    "slack": alert.sent_via_slack
+                },
+                "created_at": alert.created_at
+            }
+            for alert in alerts
+        ]
+    }
+
+@router_v2.get("/users/{user_id}/portfolio/history")
+async def get_portfolio_history(
+    user_id: int,
+    wallet_address: str,
+    days: int = 7,
+    db: Session = Depends(get_db)
+):
+    """Get historical portfolio snapshots for a monitored address"""
+    try:
+        monitored = db.query(MonitoredAddress).filter(
+            MonitoredAddress.user_id == user_id,
+            MonitoredAddress.wallet_address == wallet_address.lower()
+        ).first()
+        
+        if not monitored:
+            raise HTTPException(status_code=404, detail="Address not monitored by this user")
+        
+        cutoff = datetime.now() - timedelta(days=days)
+        snapshots = db.query(PositionSnapshot).filter(
+            PositionSnapshot.monitored_address_id == monitored.id,
+            PositionSnapshot.snapshot_time >= cutoff
+        ).order_by(PositionSnapshot.snapshot_time).all()
+        
+        if not snapshots:
+            return {
+                "wallet_address": wallet_address,
+                "period_days": days,
+                "snapshots": [],
+                "message": "No historical data available"
+            }
+        
+        history = []
+        for snapshot in snapshots:
+            history.append({
+                "timestamp": snapshot.snapshot_time.isoformat(),
+                "collateral_usd": round(snapshot.total_collateral_usd, 2),
+                "debt_usd": round(snapshot.total_debt_usd, 2),
+                "health_factor": round(snapshot.health_factor, 3) if snapshot.health_factor else None,
+                "ltv_ratio": round(snapshot.ltv_ratio, 4) if snapshot.ltv_ratio else None,
+                "risk_category": snapshot.risk_category
+            })
+        
+        first = snapshots[0]
+        last = snapshots[-1]
+        
+        collateral_change = last.total_collateral_usd - first.total_collateral_usd
+        debt_change = last.total_debt_usd - first.total_debt_usd
+        hf_change = (last.health_factor - first.health_factor) if (last.health_factor and first.health_factor) else None
+        
+        return {
+            "wallet_address": wallet_address,
+            "period_days": days,
+            "snapshot_count": len(snapshots),
+            "trends": {
+                "collateral_change_usd": round(collateral_change, 2),
+                "collateral_change_percent": round((collateral_change / first.total_collateral_usd * 100) if first.total_collateral_usd > 0 else 0, 2),
+                "debt_change_usd": round(debt_change, 2),
+                "debt_change_percent": round((debt_change / first.total_debt_usd * 100) if first.total_debt_usd > 0 else 0, 2),
+                "health_factor_change": round(hf_change, 3) if hf_change else None
+            },
+            "snapshots": history
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch history: {str(e)}")
+
+class CacheInvalidateRequest(BaseModel):
+    wallet_address: str
+    chain: Optional[str] = None  # If None, invalidate all chains for wallet
+
+@router_v2.post("/portfolio/cache/invalidate")
+async def invalidate_portfolio_cache(request: CacheInvalidateRequest):
+    """Manually invalidate cache for a specific wallet"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        wallet = request.wallet_address.lower()
+        
+        if request.chain:
+            # Invalidate specific chain
+            cache_key = portfolio_service.cache._get_cache_key(wallet, request.chain)
+            cache_path = portfolio_service.cache._get_cache_path(cache_key)
+            
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+                return {
+                    "success": True,
+                    "message": f"Cache invalidated for {wallet} on {request.chain}"
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "No cache found for this wallet/chain"
+                }
+        else:
+            # Invalidate all chains for this wallet
+            count = 0
+            for chain in portfolio_service.rpc_endpoints.keys():
+                cache_key = portfolio_service.cache._get_cache_key(wallet, chain)
+                cache_path = portfolio_service.cache._get_cache_path(cache_key)
+                
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+                    count += 1
+            
+            return {
+                "success": True,
+                "message": f"Cache invalidated for {wallet} on {count} chains"
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache invalidation failed: {str(e)}")
+
+
+@router_v2.get("/portfolio/cache/stats")
+async def get_cache_stats():
+    """Get cache statistics"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        cache_dir = portfolio_service.cache.cache_dir
+        
+        if not os.path.exists(cache_dir):
+            return {
+                "total_cached_entries": 0,
+                "cache_size_mb": 0,
+                "cache_directory": cache_dir
+            }
+        
+        cache_files = [f for f in os.listdir(cache_dir) if f.endswith('.json')]
+        
+        total_size = 0
+        valid_entries = 0
+        expired_entries = 0
+        
+        for filename in cache_files:
+            filepath = os.path.join(cache_dir, filename)
+            total_size += os.path.getsize(filepath)
+            
+            try:
+                with open(filepath, 'r') as f:
+                    cached_data = json.load(f)
+                cached_time = datetime.fromisoformat(cached_data['cached_at'])
+                
+                if datetime.now(timezone.utc) - cached_time > portfolio_service.cache.cache_ttl:
+                    expired_entries += 1
+                else:
+                    valid_entries += 1
+            except:
+                expired_entries += 1
+        
+        return {
+            "total_cached_entries": len(cache_files),
+            "valid_entries": valid_entries,
+            "expired_entries": expired_entries,
+            "cache_size_mb": round(total_size / (1024 * 1024), 2),
+            "cache_directory": cache_dir,
+            "cache_ttl_minutes": portfolio_service.cache.cache_ttl.total_seconds() / 60
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get cache stats: {str(e)}")
+
+
+@router_v2.post("/portfolio/cache/cleanup")
+async def cleanup_cache():
+    """Manually trigger cache cleanup (remove expired entries)"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        portfolio_service.cache.clear_expired()
+        
+        return {
+            "success": True,
+            "message": "Cache cleanup completed"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache cleanup failed: {str(e)}")
+    
+@router_v2.post("/portfolio/view-debug")
+async def view_portfolio_debug(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """
+    DEBUG ENDPOINT - See raw portfolio response structure
+    Use this to understand what keys are actually returned
+    """
+    try:
+        if not portfolio_service:
+            return {
+                "error": "Portfolio service not initialized",
+                "service_is_none": True
+            }
+        
+        logger.info(f"🔍 DEBUG: Fetching portfolio for {request.wallet_address}")
+        
+        # Get raw portfolio data
+        portfolio = portfolio_service.get_user_portfolio(
+            wallet_address=request.wallet_address,
+            chains=request.chains
+        )
+        
+        # Show the structure
+        debug_info = {
+            "success": True,
+            "data_type": str(type(portfolio)),
+            "top_level_keys": list(portfolio.keys()) if isinstance(portfolio, dict) else "Not a dict",
+            "wallet_address": portfolio.get('wallet_address') if isinstance(portfolio, dict) else None,
+            "has_chain_details": 'chain_details' in portfolio if isinstance(portfolio, dict) else False,
+            "has_portfolio_data": 'portfolio_data' in portfolio if isinstance(portfolio, dict) else False,
+            "chain_details_keys": list(portfolio.get('chain_details', {}).keys()) if isinstance(portfolio, dict) else [],
+            "full_response": portfolio  # The actual complete response
+        }
+        
+        # Try to serialize to catch any issues
+        try:
+            import json
+            json_test = json.dumps(debug_info)
+            debug_info["json_serializable"] = True
+            debug_info["response_size_bytes"] = len(json_test)
+        except Exception as e:
+            debug_info["json_serializable"] = False
+            debug_info["serialization_error"] = str(e)
+        
+        return debug_info
+        
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }
+
+
+@router_v2.get("/portfolio/service-check")
+async def portfolio_service_check():
+    """Check if portfolio service is properly initialized"""
+    try:
+        if portfolio_service is None:
+            return {
+                "initialized": False,
+                "message": "Portfolio service is None - need to call init_services()"
+            }
+        
+        return {
+            "initialized": True,
+            "type": str(type(portfolio_service)),
+            "has_cache": hasattr(portfolio_service, 'cache'),
+            "has_price_fetcher": hasattr(portfolio_service, 'price_fetcher'),
+            "has_asset_fetcher": hasattr(portfolio_service, 'asset_fetcher'),
+            "rpc_endpoints": list(portfolio_service.rpc_endpoints.keys()) if hasattr(portfolio_service, 'rpc_endpoints') else [],
+            "message": "Portfolio service is properly initialized"
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "initialized": False
+        }
+ 
+@router_v2.post("/portfolio/diagnose-assets")
+async def diagnose_asset_breakdown(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """Diagnostic endpoint - FIXED for new JSON structure"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        wallet_address = request.wallet_address
+        chain = request.chains[0] if request.chains else 'ethereum'
+        
+        logger.info(f"🔍 Diagnosing {wallet_address} on {chain}")
+        
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+        
+        if not w3.is_connected():
+            return {"error": f"RPC not connected for {chain}"}
+        
+        account_data = portfolio_service.get_comprehensive_account_data(w3, chain, wallet_address)
+        
+        # FIXED: Handle new JSON structure
+        chain_assets = portfolio_service.assets_data.get('all_assets', {}).get(chain, [])
+        
+        logger.info(f"📊 Found {len(chain_assets)} assets to check")
+        
+        results = []
+        for i, reserve_data in enumerate(chain_assets[:10]):
+            symbol = reserve_data.get('symbol', 'UNKNOWN')
+            atoken_address = reserve_data.get('aTokenAddress')  # New format has this!
+            
+            if not atoken_address:
+                results.append({
+                    'index': i,
+                    'symbol': symbol,
+                    'status': 'NO_ATOKEN_ADDRESS',
+                    'reserve_keys': list(reserve_data.keys())
+                })
+                continue
+            
+            try:
+                checksum_wallet = Web3.to_checksum_address(wallet_address)
+                checksum_atoken = Web3.to_checksum_address(atoken_address)
+                
+                token_abi = [{
+                    "constant": True,
+                    "inputs": [{"name": "_owner", "type": "address"}],
+                    "name": "balanceOf",
+                    "outputs": [{"name": "balance", "type": "uint256"}],
+                    "type": "function"
+                }]
+                
+                atoken_contract = w3.eth.contract(
+                    address=checksum_atoken,
+                    abi=token_abi
+                )
+                
+                balance = atoken_contract.functions.balanceOf(checksum_wallet).call()
+                
+                results.append({
+                    'index': i,
+                    'symbol': symbol,
+                    'atoken_address': atoken_address,
+                    'balance': balance,
+                    'balance_human': balance / (10 ** reserve_data.get('decimals', 18)),
+                    'status': 'SUCCESS' if balance > 0 else 'ZERO_BALANCE'
+                })
+                
+            except Exception as e:
+                results.append({
+                    'index': i,
+                    'symbol': symbol,
+                    'atoken_address': atoken_address,
+                    'status': 'ERROR',
+                    'error': str(e)
+                })
+        
+        no_atoken = len([r for r in results if r.get('status') == 'NO_ATOKEN_ADDRESS'])
+        errors = len([r for r in results if r.get('status') == 'ERROR'])
+        zero_balance = len([r for r in results if r.get('status') == 'ZERO_BALANCE'])
+        has_balance = len([r for r in results if r.get('status') == 'SUCCESS'])
+        
+        return {
+            "wallet_address": wallet_address,
+            "chain": chain,
+            "json_format": "NEW (with aTokenAddress)" if chain_assets and 'aTokenAddress' in chain_assets[0] else "OLD (missing aTokenAddress)",
+            "account_data_summary": {
+                "has_collateral": account_data['total_collateral_usd'] > 0 if account_data else False,
+                "has_debt": account_data['total_debt_usd'] > 0 if account_data else False,
+                "collateral_usd": account_data['total_collateral_usd'] if account_data else 0,
+                "debt_usd": account_data['total_debt_usd'] if account_data else 0
+            },
+            "asset_checking": {
+                "total_assets_in_json": len(chain_assets),
+                "assets_checked": len(results),
+                "no_atoken_address": no_atoken,
+                "errors": errors,
+                "zero_balance": zero_balance,
+                "has_balance": has_balance
+            },
+            "detailed_results": results,
+            "issue_diagnosis": {
+                "likely_cause": (
+                    "Assets found with balances! Should work now." if has_balance > 0
+                    else "All assets have zero balance - wallet may use different protocol" if zero_balance > 0
+                    else "aToken addresses not in JSON" if no_atoken > 5
+                    else "RPC call errors" if errors > 5
+                    else "Unknown issue"
+                ),
+                "recommendation": (
+                    "✅ Everything working! Restart server to see detailed breakdown." if has_balance > 0
+                    else "Check if wallet address is correct or uses Aave V2" if zero_balance > 0
+                    else "Regenerate JSON with complete data" if no_atoken > 5
+                    else "Check RPC endpoint" if errors > 5
+                    else "Review logs"
+                )
+            }
+        }
+        
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+    
+@router_v2.post("/portfolio/debug-comprehensive")
+async def debug_comprehensive_debt(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """Comprehensive debug for debt detection issues"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        wallet_address = request.wallet_address
+        chain = request.chains[0] if request.chains else 'ethereum'
+        
+        w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+        
+        if not w3.is_connected():
+            return {"error": f"RPC not connected for {chain}"}
+        
+        # Get account data
+        account_data = portfolio_service.get_comprehensive_account_data(w3, chain, wallet_address)
+        
+        # Check ALL reserves for debt
+        chain_assets = portfolio_service.assets_data.get('all_assets', {}).get(chain, [])
+        
+        token_abi = [{
+            "constant": True,
+            "inputs": [{"name": "_owner", "type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"name": "balance", "type": "uint256"}],
+            "type": "function"
+        }]
+        
+        all_results = []
+        debt_found = []
+        
+        for i, reserve in enumerate(chain_assets):
+            symbol = reserve.get('symbol', f'UNKNOWN_{i}')
+            underlying_asset = reserve.get('underlyingAsset') or reserve.get('address')
+            atoken_address = reserve.get('aTokenAddress')
+            variable_debt_token = reserve.get('variableDebtTokenAddress')
+            stable_debt_token = reserve.get('stableDebtTokenAddress')
+            
+            asset_info = {
+                'symbol': symbol,
+                'underlying_asset': underlying_asset,
+                'atoken_address': atoken_address,
+                'variable_debt_token': variable_debt_token,
+                'stable_debt_token': stable_debt_token,
+                'decimals': reserve.get('decimals', 18),
+                'collateral_balance': 0,
+                'variable_debt_balance': 0,
+                'stable_debt_balance': 0,
+                'total_debt_balance': 0
+            }
+            
+            # Check aToken balance (collateral)
+            if atoken_address:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(atoken_address),
+                        abi=token_abi
+                    )
+                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+                    asset_info['collateral_balance'] = balance
+                except Exception as e:
+                    asset_info['collateral_error'] = str(e)
+            
+            # Check variable debt
+            if variable_debt_token:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(variable_debt_token),
+                        abi=token_abi
+                    )
+                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+                    asset_info['variable_debt_balance'] = balance
+                    asset_info['total_debt_balance'] += balance
+                except Exception as e:
+                    asset_info['variable_debt_error'] = str(e)
+            
+            # Check stable debt
+            if stable_debt_token:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(stable_debt_token),
+                        abi=token_abi
+                    )
+                    balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+                    asset_info['stable_debt_balance'] = balance
+                    asset_info['total_debt_balance'] += balance
+                except Exception as e:
+                    asset_info['stable_debt_error'] = str(e)
+            
+            # Convert to human readable
+            decimals_factor = 10 ** asset_info['decimals']
+            asset_info['collateral_human'] = asset_info['collateral_balance'] / decimals_factor
+            asset_info['variable_debt_human'] = asset_info['variable_debt_balance'] / decimals_factor
+            asset_info['stable_debt_human'] = asset_info['stable_debt_balance'] / decimals_factor
+            asset_info['total_debt_human'] = asset_info['total_debt_balance'] / decimals_factor
+            
+            if asset_info['total_debt_balance'] > 0:
+                asset_info['status'] = 'HAS_DEBT'
+                debt_found.append(asset_info)
+            elif asset_info['collateral_balance'] > 0:
+                asset_info['status'] = 'HAS_COLLATERAL'
+            else:
+                asset_info['status'] = 'NO_POSITION'
+            
+            all_results.append(asset_info)
+        
+        # Check if we're missing any debt tokens in our asset data
+        missing_debt_tokens = [r for r in all_results if not r['variable_debt_token'] and not r['stable_debt_token']]
+        
+        return {
+            "wallet_address": wallet_address,
+            "chain": chain,
+            "account_data": account_data,
+            "total_assets_checked": len(all_results),
+            "assets_with_collateral": len([r for r in all_results if r['collateral_balance'] > 0]),
+            "assets_with_debt": len(debt_found),
+            "debt_positions_found": debt_found,
+            "missing_debt_tokens_count": len(missing_debt_tokens),
+            "missing_debt_tokens_samples": missing_debt_tokens[:5],
+            "all_assets_sample": all_results[:10],
+            "diagnosis": (
+                f"Found {len(debt_found)} debt positions" if debt_found
+                else f"No debt found in {len(all_results)} assets. Account shows {account_data.get('total_debt_usd', 0) if account_data else 0} USD debt. Possible issues: outdated asset data, different protocol version, or stable debt tokens missing."
+            )
+        }
+        
+    except Exception as e:
+        logger.error(f"Comprehensive debug error: {e}")
+        return {"error": str(e)}
+@router_v2.post("/portfolio/debug-asset-flow")
+async def debug_asset_flow(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """Debug the complete asset flow from detection to response"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        wallet_address = request.wallet_address
+        chain = request.chains[0] if request.chains else 'ethereum'
+        
+        w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+        
+        if not w3.is_connected():
+            return {"error": f"RPC not connected for {chain}"}
+        
+        # Step 1: Get account data
+        account_data = portfolio_service.get_comprehensive_account_data(w3, chain, wallet_address)
+        
+        # Step 2: Get asset breakdown
+        assets_breakdown = portfolio_service._get_assets_breakdown(w3, chain, wallet_address)
+        
+        # Step 3: Process assets breakdown
+        collateral_assets = []
+        debt_assets = []
+        
+        for asset in assets_breakdown:
+            # Process collateral
+            if asset.get('collateral_balance', 0) > 0:
+                collateral_assets.append({
+                    'symbol': asset.get('symbol', 'UNKNOWN'),
+                    'address': asset.get('address', ''),
+                    'balance': float(asset.get('collateral_balance', 0)),
+                    'value_usd': float(asset.get('collateral_usd', 0)),
+                    'supply_apy': float(asset.get('supply_apy', 0)),
+                    'asset_type': 'collateral'
+                })
+            
+            # Process debt
+            variable_debt = asset.get('variable_debt_balance', 0)
+            stable_debt = asset.get('stable_debt_balance', 0)
+            total_debt = variable_debt + stable_debt
+            
+            if total_debt > 0:
+                debt_type = []
+                if variable_debt > 0:
+                    debt_type.append('variable')
+                if stable_debt > 0:
+                    debt_type.append('stable')
+                
+                debt_assets.append({
+                    'symbol': asset.get('symbol', 'UNKNOWN'),
+                    'address': asset.get('address', ''),
+                    'balance': float(total_debt),
+                    'variable_debt': float(variable_debt),
+                    'stable_debt': float(stable_debt),
+                    'value_usd': float(asset.get('debt_usd', 0)),
+                    'borrow_apy': float(asset.get('borrow_apy', 0)),
+                    'asset_type': 'debt',
+                    'debt_type': ', '.join(debt_type) if debt_type else 'unknown'
+                })
+        
+        return {
+            "wallet_address": wallet_address,
+            "chain": chain,
+            "account_data": account_data,
+            "assets_breakdown_count": len(assets_breakdown),
+            "assets_breakdown_details": assets_breakdown,
+            "collateral_assets_count": len(collateral_assets),
+            "collateral_assets": collateral_assets,
+            "debt_assets_count": len(debt_assets),
+            "debt_assets": debt_assets,
+            "diagnosis": f"Found {len(debt_assets)} debt assets in processing"
+        }
+        
+    except Exception as e:
+        logger.error(f"Asset flow debug error: {e}")
+        return {"error": str(e)}
+                    
+__all__ = ['router_v1', 'router_v2', 'init_services']
+

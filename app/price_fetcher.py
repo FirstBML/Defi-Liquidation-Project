@@ -1,13 +1,11 @@
-# enhanced_risk_early_warning_system.py
+# ============================================================
+# FIX 3: Price Fetcher - Symbol Mapping Issue
+# ============================================================
 """
-Enhanced Risk Early-Warning System for AAVE Lending Protocol
-Features:
-- Progress tracking and detailed logging
-- Smart caching with joblib
-- Data filtering for meaningful analysis
-- Comprehensive AAVE-specific metrics
-- API rate limiting and error handling
-- Detailed position and liquidation DataFrames
+The price fetcher is returning empty because CoinGecko uses
+different IDs than the token symbols.
+
+File: app/price_fetcher.py - Add symbol mapping
 """
 
 import pandas as pd
@@ -19,21 +17,108 @@ import time
 import joblib
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, Union
-from dune_client.client import DuneClient
-from dotenv import load_dotenv
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-load_dotenv()
-
-
 # Configure caching
 CACHE_DIR = Path("risk_cache")
 CACHE_DIR.mkdir(exist_ok=True)
-PRICE_CACHE_TTL = 7200  # 5 minutes for current prices
-HISTORICAL_CACHE_TTL = 7200  # 1 hour for historical data
-RESERVE_CACHE_TTL = 7200  # 15 minutes for reserve data
+
+SYMBOL_TO_COINGECKO_ID = {
+    # Ethereum assets
+    'WETH': 'weth',
+    'ETH': 'ethereum',
+    'WBTC': 'wrapped-bitcoin',
+    'USDC': 'usd-coin',
+    'USDT': 'tether',
+    'DAI': 'dai',
+    'LINK': 'chainlink',
+    'AAVE': 'aave',
+    'UNI': 'uniswap',
+    'MKR': 'maker',
+    'LDO': 'lido-dao',
+    'ENS': 'ethereum-name-service',
+    'CRV': 'curve-dao-token',
+    'BAL': 'balancer',
+    '1INCH': '1inch',
+    'SUSHI': 'sushi',
+    
+    # Wrapped/Staked variants
+    'wstETH': 'wrapped-steth',
+    'stETH': 'staked-ether',
+    'rETH': 'rocket-pool-eth',
+    'cbETH': 'coinbase-wrapped-staked-eth',
+    'weETH': 'wrapped-eeth',
+    'ETHx': 'stader-ethx',
+    
+    # Bitcoin variants
+    'BTCB': 'binance-bitcoin',
+    'BTC.b': 'bitcoin-avalanche-bridged-btc-b',
+    'WBTC.e': 'wrapped-bitcoin',
+    'cbBTC': 'coinbase-wrapped-btc',
+    'tBTC': 'tbtc',
+    'LBTC': 'lbtc',
+    'eBTC': 'ebtc',
+    'FBTC': 'fbtc',
+    
+    # Stablecoins
+    'USDC.e': 'bridged-usd-coin',
+    'USDbC': 'bridged-usd-coin-base',
+    'USDS': 'usds',
+    'FDUSD': 'first-digital-usd',
+    'LUSD': 'liquity-usd',
+    'sUSD': 'nusd',
+    'USDe': 'ethena-usde',
+    'sUSDe': 'staked-ethena-usde',
+    'EURC': 'euro-coin',
+    'EURS': 'stasis-eurs',
+    
+    # Avalanche
+    'WAVAX': 'wrapped-avax',
+    'AVAX': 'avalanche-2',
+    'sAVAX': 'benqi-liquid-staked-avax',
+    'WETH.e': 'weth',
+    'LINK.e': 'chainlink',
+    'AAVE.e': 'aave',
+    'DAI.e': 'dai',
+    'USDt': 'tether',
+    'AUSD': 'alpaca-usd',
+    
+    # Polygon/Matic
+    'WPOL': 'pol-polygon',
+    'WMATIC': 'wmatic',
+    'MATIC': 'matic-network',
+    'MaticX': 'stader-maticx',
+    'stMATIC': 'lido-staked-matic',
+    
+    # Optimism
+    'OP': 'optimism',
+    
+    # BSC
+    'WBNB': 'wbnb',
+    'Cake': 'pancakeswap-token',
+    
+    # Celo
+    'CELO': 'celo',
+    'cUSD': 'celo-dollar',
+    'cEUR': 'celo-euro',
+    'USD₮': 'tether',
+    
+    # Gnosis
+    'GNO': 'gnosis',
+    'WXDAI': 'xdai',
+    'sDAI': 'savings-dai',
+    
+    # Fantom
+    'WFTM': 'fantom',
+    
+    # Other
+    'GHO': 'gho',
+    'DPI': 'defipulse-index',
+    'GHST': 'aavegotchi',
+    'ZK': 'zksync'
+}
 
 class ProgressTracker:
     """Track and display analysis progress"""
@@ -158,7 +243,6 @@ CHAIN_TO_PLATFORM = {
     "zksync": "zksync-era",
     "tron": "tron",
     "near": "near",
-    # add more if needed
 }
 
 # ---------- Helper functions ----------
@@ -185,7 +269,6 @@ def _normalize_symbol(sym: str) -> str:
     # split on '.' or '-' and take first part (common suffix patterns)
     return str(sym).split(".")[0].split("-")[0].upper()
 
-# ---------- Class ----------
 class EnhancedPriceFetcher:
     """
     Holistic CoinGecko price fetcher with:
@@ -237,6 +320,18 @@ class EnhancedPriceFetcher:
 
         print(f"EnhancedPriceFetcher initialized. Coingecko Pro: {'YES' if self.api_key else 'NO'}")
         print(f"Base URL: {self.base}, cache_ttl={self.cache_ttl}s, request_delay={self.request_delay}s")
+        
+    def get_coingecko_id(self, symbol: str) -> Optional[str]:
+        """Map token symbol to CoinGecko ID using the comprehensive mapping"""
+        # Remove chain suffixes and normalize
+        clean_symbol = symbol.replace('.e', '').replace('₮', '').upper()
+        
+        # Direct lookup in comprehensive mapping
+        if clean_symbol in SYMBOL_TO_COINGECKO_ID:
+            return SYMBOL_TO_COINGECKO_ID[clean_symbol]
+        
+        # Try lowercase for common tokens
+        return clean_symbol.lower()
 
     # ---------- I/O / cache helpers ----------
     def _cache_key_price(self, coin_id: str, date_key: Optional[str] = None) -> str:
@@ -323,19 +418,25 @@ class EnhancedPriceFetcher:
 
         sym_norm = _normalize_symbol(symbol)
 
-        # 1. Overrides
+        # 1. Use the comprehensive symbol mapping first
+        cg_id = self.get_coingecko_id(symbol)
+        if cg_id:
+            self._set_cached_id(chain, symbol, address, cg_id)
+            return cg_id
+
+        # 2. Overrides (legacy)
         if sym_norm in TOKEN_ID_OVERRIDES:
             coin_id = TOKEN_ID_OVERRIDES[sym_norm]
             # cache it
             self._set_cached_id(chain, symbol, address, coin_id)
             return coin_id
 
-        # 2. cached id
+        # 3. cached id
         cached = self._get_cached_id(chain, symbol, address)
         if cached:
             return cached
 
-        # 3. contract lookup (chain-aware)
+        # 4. contract lookup (chain-aware)
         if address and chain:
             platform = CHAIN_TO_PLATFORM.get(chain.lower())
             if platform:
@@ -351,7 +452,7 @@ class EnhancedPriceFetcher:
                     except Exception:
                         pass
 
-        # 4. search fallback by symbol (CoinGecko returns candidates)
+        # 5. search fallback by symbol (CoinGecko returns candidates)
         url = f"{self.base}/search"
         params = {"query": sym_norm}
         resp = self._request_with_retry(url, params=params)
@@ -573,6 +674,11 @@ class EnhancedPriceFetcher:
                     results[key] = None
                     if progress:
                         progress.add_detail(f"⚠️ No CoinGecko ID for {sym} ({addr}) on {chain}")
+        
+        token_ids = [t.get("id") or t.get("mapped_symbol") or t["symbol"] for t in tokens]
+        all_coin_ids = list(coinid_map.keys()) or token_ids
+        fetched_prices = self._fetch_prices_by_ids(all_coin_ids, vs_currency=vs_currency)
+
 
         # Batch fetch prices for all coin_ids we have
         all_coin_ids = list(coinid_map.keys())
@@ -612,3 +718,112 @@ class EnhancedPriceFetcher:
                 out[orig_key] = results.get(orig_key)
 
         return out
+
+    def get_batch_prices_enhanced(self, tokens: List[Dict], progress=None) -> Dict:
+        """
+        Enhanced batch price fetcher with comprehensive symbol mapping
+        Maintains compatibility with existing pipeline
+        
+        Args:
+            tokens: List of dicts with 'symbol', 'address', 'chain'
+            progress: Optional progress bar
+        
+        Returns:
+            Dict mapping symbol to price info
+        """
+        import time
+        
+        results = {}
+        
+        # Group by unique symbols
+        unique_symbols = {}
+        for token in tokens:
+            symbol = token.get('symbol', '').upper()
+            if symbol and symbol not in unique_symbols:
+                unique_symbols[symbol] = token
+        
+        print(f"Fetching prices for {len(unique_symbols)} unique symbols...")
+        
+        # Build CoinGecko IDs list using comprehensive mapping
+        coingecko_ids = []
+        symbol_to_id = {}
+        
+        for symbol, token in unique_symbols.items():
+            cg_id = self.get_coingecko_id(symbol)
+            if cg_id:
+                coingecko_ids.append(cg_id)
+                symbol_to_id[cg_id] = symbol
+                if progress:
+                    progress.add_detail(f"Mapped {symbol} → {cg_id}")
+        
+        if not coingecko_ids:
+            print("No valid CoinGecko IDs found")
+            return results
+        
+        # Fetch in batches of 100 (CoinGecko limit)
+        batch_size = 100
+        for i in range(0, len(coingecko_ids), batch_size):
+            batch = coingecko_ids[i:i+batch_size]
+            ids_param = ','.join(batch)
+            
+            url = f"{self.base}/simple/price"
+            params = {
+                'ids': ids_param,
+                'vs_currencies': 'usd',
+                'include_24hr_change': 'true'
+            }
+            
+            if self.api_key:
+                params['x_cg_pro_api_key'] = self.api_key
+            
+            try:
+                response = self._request_with_retry(url, params=params)
+                
+                if response and response.status_code == 200:
+                    data = response.json()
+                    
+                    # Map back to symbols
+                    for cg_id, price_data in data.items():
+                        if cg_id in symbol_to_id:
+                            symbol = symbol_to_id[cg_id]
+                            results[symbol] = {
+                                'price': price_data.get('usd', 0),
+                                'change_24h': price_data.get('usd_24h_change', 0),
+                                'source': 'coingecko'
+                            }
+                            if progress:
+                                progress.add_detail(f"✅ {symbol}: ${price_data.get('usd', 0):,.2f}")
+                    
+                elif response and response.status_code == 429:
+                    if progress:
+                        progress.add_detail(f"⚠️ Rate limit hit, waiting 60s...")
+                    time.sleep(60)
+                else:
+                    if progress:
+                        progress.add_detail(f"⚠️ API error: {response.status_code if response else 'No response'}")
+                
+            except Exception as e:
+                if progress:
+                    progress.add_detail(f"❌ Batch fetch error: {e}")
+            
+            # Rate limiting
+            if i + batch_size < len(coingecko_ids):
+                time.sleep(self.request_delay)
+        
+        # Fill in missing symbols
+        for symbol in unique_symbols.keys():
+            if symbol not in results:
+                # Try getting from symbol directly using existing methods
+                price = self.get_current_price(symbol)
+                if price:
+                    results[symbol] = {'price': price, 'change_24h': 0, 'source': 'coingecko_fallback'}
+                else:
+                    results[symbol] = {'price': 0, 'source': 'not_found'}
+        
+        success_count = len([r for r in results.values() if r['price'] > 0])
+        if progress:
+            progress.add_detail(f"Successfully fetched {success_count}/{len(unique_symbols)} prices")
+        else:
+            print(f"Successfully fetched {success_count}/{len(unique_symbols)} prices")
+        
+        return results

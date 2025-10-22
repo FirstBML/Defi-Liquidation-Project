@@ -1,6 +1,6 @@
 """
-Enhanced FastAPI Application for DeFi Liquidation Risk System
-Fixed for Railway deployment with proper port binding
+Enhanced FastAPI Application - FIXED
+Handles missing PostgreSQL gracefully
 """
 
 from fastapi import FastAPI
@@ -14,7 +14,7 @@ import warnings
 import logging
 import sys
 
-# Setup logging FIRST
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -27,22 +27,43 @@ warnings.filterwarnings('ignore', module='eth_utils')
 # Load environment variables
 load_dotenv()
 
-# Import with error handling
+# ==================== DATABASE CHECK ====================
+def check_database():
+    """Check if database is accessible"""
+    try:
+        from app.db_models import SessionLocal, engine
+        
+        # Try to connect
+        with engine.connect() as conn:
+            conn.execute("SELECT 1")
+        
+        logger.info("✅ Database connection successful")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        logger.error("=" * 70)
+        logger.error("⚠️  POSTGRESQL NOT RUNNING OR NOT CONFIGURED")
+        logger.error("=" * 70)
+        logger.error("Solutions:")
+        logger.error("1. Start PostgreSQL server: pg_ctl -D /path/to/data start")
+        logger.error("2. Or use Railway/cloud PostgreSQL (set DATABASE_URL)")
+        logger.error("3. App will run but database features disabled")
+        logger.error("=" * 70)
+        return False
+
+# Check database on startup
+DB_AVAILABLE = check_database()
+
+# Import API with proper error handling
 try:
     from app import api
     logger.info("✅ API module imported successfully")
 except ImportError as e:
     logger.error(f"❌ Failed to import API module: {e}")
-    try:
-        import api
-        logger.info("✅ API module imported (fallback)")
-    except ImportError as e2:
-        logger.error(f"❌ Fallback import failed: {e2}")
-        raise
+    raise
 
-# ------------------------------------------------------
-# 🔹 Application Lifespan (startup/shutdown events)
-# ------------------------------------------------------
+# ==================== LIFESPAN ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,69 +71,70 @@ async def lifespan(app: FastAPI):
     logger.info(f"🌍 Environment: {'Production' if os.getenv('RAILWAY_ENVIRONMENT') else 'Development'}")
     logger.info(f"🔌 Port: {os.getenv('PORT', '8080')}")
     
-    # Start scheduler with error handling
+    if not DB_AVAILABLE:
+        logger.warning("⚠️  Starting without database connection")
+        yield
+        return
+    
+    # Initialize services only if DB available
     try:
-        from app.scheduler import start_scheduler
-        start_scheduler()
+        api.init_services()
+        logger.info("✅ Portfolio and Alert services initialized")
+    except Exception as e:
+        logger.error(f"⚠️ Service initialization failed: {e}")
+    
+    # Start scheduler
+    try:
+        from app.scheduler import unified_scheduler
+        unified_scheduler.start_scheduler()
         logger.info("✅ Scheduler initialized")
     except Exception as e:
-        logger.error(f"⚠️ Scheduler failed to start (non-critical): {e}")
+        logger.error(f"⚠️ Scheduler failed to start: {e}")
     
-    # 🔥 TRIGGER INITIAL DATA LOAD (NEW)
-    try:
-        logger.info("🔄 Triggering initial data refresh...")
-        from app.db_models import SessionLocal
-        db = SessionLocal()
-        
-        # Check if database is empty
-        from app.db_models import Reserve, Position
-        reserve_count = db.query(Reserve).count()
-        position_count = db.query(Position).count()
-        
-        logger.info(f"📊 Current data: {reserve_count} reserves, {position_count} positions")
-        
-        if reserve_count == 0 or position_count == 0:
-            logger.info("🚨 Database is empty - triggering full refresh")
-            # Note: You'll need to manually call /api/data/refresh after startup
-            logger.info("📝 To populate data, visit: /docs and call POST /api/data/refresh")
-        
-        db.close()
-    except Exception as e:
-        logger.warning(f"⚠️ Initial data check failed: {e}")
+    # Check database
+    if DB_AVAILABLE:
+        try:
+            from app.db_models import SessionLocal, Reserve, Position
+            db = SessionLocal()
+            reserve_count = db.query(Reserve).count()
+            position_count = db.query(Position).count()
+            logger.info(f"📊 Current data: {reserve_count} reserves, {position_count} positions")
+            
+            if reserve_count == 0 or position_count == 0:
+                logger.info("🚨 Database is empty - visit /docs and call POST /api/data/refresh")
+            
+            db.close()
+        except Exception as e:
+            logger.warning(f"⚠️ Initial data check failed: {e}")
     
     yield
     
-    logger.info(f"[{datetime.now(timezone.utc)}] 🛑 Shutting down FastAPI app...")
+    logger.info(f"[{datetime.now(timezone.utc)}] 🛑 Shutting down...")
     try:
-        from app.scheduler import scheduler
-        if scheduler.running:
-            scheduler.shutdown()
+        from app.scheduler import unified_scheduler
+        if unified_scheduler.scheduler.running:
+            unified_scheduler.stop_scheduler()
             logger.info("✅ Scheduler stopped")
     except Exception as e:
         logger.error(f"Error stopping scheduler: {e}")
 
+# ==================== APP INITIALIZATION ====================
 
-# ------------------------------------------------------
-# 🔹 Initialize FastAPI App
-# ------------------------------------------------------
 app = FastAPI(
     title="DeFi Risk Early-Warning System",
-    description="Real-time liquidation risk monitoring for DeFi protocols",
+    description="Real-time liquidation risk monitoring",
     version="2.0.0",
     lifespan=lifespan,
 )
 
+# ==================== CORS ====================
 
-# ------------------------------------------------------
-# 🔹 CORS Configuration (Fixed for Railway)
-# ------------------------------------------------------
 ALLOWED_ORIGINS = [
     "https://perspectively-slaty-sheilah.ngrok-free.dev",
-    "https://your-vercel-dashboard.vercel.app",
     "http://localhost:3000",
     "https://easygoing-charm-production-707b.up.railway.app",
-    "https://*.railway.app",  # Allow all Railway subdomains
-    "*"  # Development only - REMOVE IN PRODUCTION
+    "https://*.railway.app",
+    "*"
 ]
 
 app.add_middleware(
@@ -123,30 +145,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==================== INCLUDE ROUTERS ====================
 
-# ------------------------------------------------------
-# 🔹 Include API Router
-# ------------------------------------------------------
 try:
-    app.include_router(api.router, prefix="/api")
-    logger.info("✅ API router included at /api")
+    app.include_router(api.router_v1)
+    app.include_router(api.router_v2)
+    logger.info("✅ Both API routers included")
 except Exception as e:
-    logger.error(f"❌ Failed to include API router: {e}")
+    logger.error(f"❌ Failed to include routers: {e}")
     raise
 
-
-# ------------------------------------------------------
-# 🔹 Root & Health Endpoints
-# ------------------------------------------------------
+# ==================== ROOT ENDPOINTS ====================
 
 @app.get("/", include_in_schema=False)
 async def root():
-    """Redirect root to API documentation"""
     return RedirectResponse(url="/docs")
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint for Railway"""
+    if not DB_AVAILABLE:
+        return {
+            "status": "degraded",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "error": "Database not available",
+            "message": "PostgreSQL connection required"
+        }
+    
     from app.db_models import SessionLocal, Reserve, Position
     
     try:
@@ -176,12 +200,19 @@ def health_check():
 
 @app.get("/startup-status")
 def startup_status():
-    """Debug endpoint to check what loaded"""
+    if not DB_AVAILABLE:
+        return {
+            "api_loaded": True,
+            "database_connected": False,
+            "error": "PostgreSQL not running",
+            "message": "Start PostgreSQL or set DATABASE_URL"
+        }
+    
     from app.db_models import SessionLocal, Reserve, Position
     
     try:
-        from app.scheduler import scheduler
-        scheduler_running = scheduler.running
+        from app.scheduler import unified_scheduler
+        scheduler_running = unified_scheduler
     except:
         scheduler_running = False
     
@@ -206,15 +237,6 @@ def startup_status():
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "port": os.getenv("PORT", "8080"),
-        "database_url_set": bool(os.getenv("DATABASE_URL"))
+        "database_url_set": bool(os.getenv("DATABASE_URL")),
+        "services_initialized": api.portfolio_service is not None
     }
-
-@app.on_event("startup")
-async def startup_diagnostic():
-    logger.info("=== STARTUP DIAGNOSTICS ===")
-    logger.info(f"PORT: {os.getenv('PORT')}")
-    logger.info(f"DATABASE_URL: {'SET' if os.getenv('DATABASE_URL') else 'NOT SET'}")
-    logger.info(f"Python version: {sys.version}")
-    logger.info(f"Working directory: {os.getcwd()}")
-    logger.info(f"Files in app/: {os.listdir('app')}")
-    logger.info("=========================")
