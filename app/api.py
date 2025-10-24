@@ -7,7 +7,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional
 from datetime import datetime, timezone, timedelta
-from sqlalchemy import func, desc, case, and_
+from sqlalchemy import func, desc, case, and_, text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 from collections import defaultdict, Counter

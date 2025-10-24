@@ -33,11 +33,12 @@ def check_database():
     """Check if database is accessible"""
     try:
         from app.db_models import SessionLocal, engine
+        from sqlalchemy import text  # Add this import
         
-        # Try to connect
+        # Try to connect - FIXED SQL execution
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
-        
+            conn.execute(text("SELECT 1"))  # Wrap in text()
+                    
         logger.info("✅ Database connection successful")
         return True
         
