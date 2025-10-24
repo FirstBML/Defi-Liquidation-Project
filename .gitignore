@@ -1,46 +1,101 @@
-# Ignore virtual environment (Created by venv; see https://docs.python.org/3/library/venv.html)
+# Python Virtual Environments
 venv/
+.venv/
+env/
+ENV/
+DefiLiquidation/  # Old virtual environment folder
 
-# Ignore Python cache and bytecode files
+# Python Cache and Bytecode
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
-env/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
 build/
 dist/
-*.egg-info/
+.eggs/
 
-# Ignore Jupyter Notebook files and checkpoints
+# Jupyter Notebooks
 *.ipynb
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
-# Ignore generated data files (databases, caches, CSVs, JSON outputs)
+# Database Files
 *.db
+*.db-journal
 *.db.backup*
-*.csv
-price_cache.json
+*.sqlite
+*.sqlite3
+aave_risk.db.backup_*
+
+# Cache and Temporary Data
+portfolio_cache/
 risk_cache/
-# Note: risk_cache/ is already partially covered, but this ensures the root one too
+app/risk_cache/
+app/__pycache__/
+price_cache.json
+coin_id_cache.json
+*.cache
 
-# Ignore environment and config files with secrets
+# CSV and Data Export Files
+*.csv
+enhanced_analysis_results_*.csv
+
+# Environment Variables and Secrets
 .env
+.env.*
 .env.local
-*.env.*
+.env.production
+.env.development
+!.env.example  # Keep example env file if you have one
 
-# Ignore directories/folders (legacy, tests, caches)
+# Test and Development Folders
 Test&Fixing/
-DefiLiquidation/
-risk_cache/  # Covers both root and app/risk_cache/
+compatibility_test/
+railway_test/
+test_*/
+tests/
+testing/
 
-# Ignore IDE/Editor files
+# Script Files (not needed in production)
+add_*.py
+update_*.py
+verify_*.py
+check_*.py
+sync_*.py
+run_*.py
+manual_*.py
+scheduled_*.py
+system_*.py
+automated_*.py
+railway_uploader.py
+fetch_aave_data.py
+fallback_data_loader.py
+list_endpoints.py
+create_user_tables.py
+
+# Old/Unused App Files
+app/AAveRiskAnalyze.py
+app/startup.ps1
+
+# IDE and Editor Files
 .vscode/
 .idea/
 *.swp
 *.swo
+*.swn
+*~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
 
-# Ignore OS generated files
+# OS Generated Files
 .DS_Store
 .DS_Store?
 ._*
@@ -48,13 +103,51 @@ risk_cache/  # Covers both root and app/risk_cache/
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
 
-# Ignore logs and temporary files
+# Logs and Temporary Files
 *.log
 logs/
 tmp/
 temp/
+*.tmp
+*.bak
+*.backup
 
-# Ignore all Jupyter notebooks and CSV files inside app folder (redundant but explicit if needed)
-app/**/*.ipynb
-app/**/*.csv
+# Coverage Reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# pytest
+.pytest_cache/
+.tox/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Production database (optional - uncomment if you want Railway to create fresh)
+# aave_risk.db
+
+# Keep these files/folders (explicitly NOT ignored)
+!app/aave_v3_complete_data_1761094969.json
+!requirements.txt
+!Procfile
+!railway.json
+!runtime.txt
+!.railwayignore
+!README.md

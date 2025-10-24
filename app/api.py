@@ -2266,6 +2266,30 @@ async def get_liquidation_history(
 # ============================================================
 # COMPLETE UPDATED VIEW_PORTFOLIO ENDPOINT WITH ALL FIXES
 # ============================================================
+def validate_wallet_address(address: str) -> str:
+    """Validate and normalize wallet address"""
+    # Remove whitespace
+    address = address.strip()
+    
+    # Check format
+    if not address.startswith('0x'):
+        raise ValueError(f"Address must start with 0x: {address}")
+    
+    # Check length (should be 42 chars: 0x + 40 hex)
+    if len(address) != 42:
+        raise ValueError(f"Invalid address length {len(address)}, should be 42: {address}")
+    
+    # Check if valid hex
+    try:
+        int(address[2:], 16)
+    except ValueError:
+        raise ValueError(f"Address contains invalid hex characters: {address}")
+    
+    # Return checksummed address
+    try:
+        return Web3.to_checksum_address(address)
+    except Exception as e:
+        raise ValueError(f"Invalid address format: {address}, error: {e}")
 
 @router_v2.post("/portfolio/view-fast")
 async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(get_db)):
@@ -2279,12 +2303,16 @@ async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(g
         if not portfolio_service:
             raise HTTPException(status_code=503, detail="Portfolio service not initialized")
         
-        wallet_address = request.wallet_address
+        # Validate address first
+        try:
+            validated_address = validate_wallet_address(request.wallet_address)
+            logger.info(f"⚡ Fast fetch for {validated_address}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid wallet address: {str(e)}")
+        
         chains = request.chains or ['ethereum']
         
-        logger.info(f"⚡ Fast fetch for {wallet_address}")
-        
-        start_time = time.time()  # This should work now with the import
+        start_time = time.time()         
         
         # Get only account data (no asset breakdown)
         chain_details = {}
@@ -2297,24 +2325,48 @@ async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(g
         
         for chain in chains:
             try:
-                from web3 import Web3
-                w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+                # ✅ FIX: Use get_working_rpc() method instead of direct RPC endpoint
+                logger.info(f"🔍 Checking {chain}...")
                 
+                # Get working RPC endpoint
+                rpc_endpoint = portfolio_service.get_working_rpc(chain)
+                logger.info(f"   Using RPC: {rpc_endpoint}")
+                
+                # Create Web3 instance with timeout
+                from web3 import Web3
+                w3 = Web3(Web3.HTTPProvider(rpc_endpoint, request_kwargs={'timeout': 15}))
+                
+                # Verify connection with actual block number check
                 if not w3.is_connected():
+                    logger.warning(f"⚠️ RPC not connected for {chain}")
                     continue
                 
-                # Get ONLY account data - skip asset breakdown completely
+                try:
+                    block = w3.eth.block_number
+                    logger.info(f"   Connected! Current block: {block}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to get block number for {chain}: {e}")
+                    continue
+                
+                # Get account data using validated address
+                logger.info(f"   Fetching account data for {validated_address[:10]}...")
                 account_data = portfolio_service.get_comprehensive_account_data(
-                    w3, chain, wallet_address
+                    w3, chain, validated_address
                 )
                 
                 if not account_data:
+                    logger.warning(f"⚠️ No account data returned for {chain}")
                     continue
+                
+                # Log the raw values
+                logger.info(f"   Raw account data: collateral={account_data.get('total_collateral_usd')}, debt={account_data.get('total_debt_usd')}")
                 
                 has_positions = (
                     account_data.get('total_collateral_usd', 0) > 0 or
                     account_data.get('total_debt_usd', 0) > 0
                 )
+                
+                logger.info(f"   Has positions: {has_positions}")
                 
                 if has_positions:
                     active_chains.append(chain)
@@ -2327,6 +2379,8 @@ async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(g
                     if chain_hf is not None and chain_hf != float('inf'):
                         if lowest_hf is None or chain_hf < lowest_hf:
                             lowest_hf = chain_hf
+                    
+                    logger.info(f"✅ {chain}: ${account_data['total_collateral_usd']:.2f} collateral, ${account_data['total_debt_usd']:.2f} debt")
                 
                 # Make account_data JSON serializable
                 serializable_account_data = {
@@ -2352,7 +2406,13 @@ async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(g
                 }
                 
             except Exception as e:
-                logger.error(f"Error fetching {chain}: {e}")
+                logger.error(f"❌ Error fetching {chain}: {e}", exc_info=True)
+                # Add error to chain details for debugging
+                chain_details[chain] = {
+                    "has_positions": False,
+                    "error": str(e),
+                    "note": "Failed to fetch data"
+                }
                 continue
         
         # Calculate metrics
@@ -2400,7 +2460,7 @@ async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(g
         elapsed = time.time() - start_time
         
         response = {
-            "wallet_address": wallet_address.lower(),
+            "wallet_address": validated_address.lower(),
             "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
             "fetch_time_seconds": round(elapsed, 2),
             "active_chains": active_chains,
@@ -2411,12 +2471,15 @@ async def view_portfolio_fast(request: PortfolioRequest, db: Session = Depends(g
             "note": "Asset breakdown not included. Use /portfolio/view for detailed breakdown."
         }
         
-        logger.info(f"⚡ Fast fetch completed in {elapsed:.2f}s")
+        logger.info(f"⚡ Fast fetch completed in {elapsed:.2f}s - {len(active_chains)} active chains: {active_chains}")
         return response
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Fast portfolio error: {e}", exc_info=True)
+        logger.error(f"💥 Fast portfolio error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Fast fetch failed: {str(e)}")
+    
 # ============================================================
 # FIX 3: Add comparison endpoint
 # ============================================================
@@ -2501,17 +2564,19 @@ async def compare_wallets(
 # FIX 12: Add get_asset_details endpoint
 @router_v2.post("/portfolio/view")
 async def view_portfolio(request: PortfolioRequest, db: Session = Depends(get_db)):
-    """View detailed portfolio for any wallet address - FIXED"""
     try:
-        if not portfolio_service:
-            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        # Validate address first
+        validated_address = validate_wallet_address(request.wallet_address)
         
-        # Get portfolio data from service
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+        
+        # Use validated address
         portfolio = portfolio_service.get_user_portfolio(
-            wallet_address=request.wallet_address,
+            wallet_address=validated_address,
             chains=request.chains
         )
-        
+                        
         # CRITICAL FIX: The service returns 'chain_details' not 'portfolio_data'
         chain_details = portfolio.get('chain_details', {})
         
@@ -2567,7 +2632,6 @@ async def view_portfolio(request: PortfolioRequest, db: Session = Depends(get_db
             status_code=500, 
             detail=f"Portfolio fetch failed: {str(e)}"
         )
-
 
 @router_v2.get("/users/{user_id}/alerts/history")
 async def get_alert_history(
@@ -3199,6 +3263,225 @@ async def debug_asset_flow(request: PortfolioRequest, db: Session = Depends(get_
     except Exception as e:
         logger.error(f"Asset flow debug error: {e}")
         return {"error": str(e)}
-                    
+@router_v2.post("/portfolio/check-all-debt")
+async def check_all_debt_positions(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """Check ALL assets for debt positions specifically"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        wallet_address = request.wallet_address
+        chain = request.chains[0] if request.chains else 'ethereum'
+        
+        w3 = Web3(Web3.HTTPProvider(portfolio_service.rpc_endpoints.get(chain)))
+        
+        if not w3.is_connected():
+            return {"error": f"RPC not connected for {chain}"}
+        
+        # Get ALL chain assets
+        chain_assets = portfolio_service.assets_data.get('all_assets', {}).get(chain, [])
+        
+        token_abi = [{
+            "constant": True,
+            "inputs": [{"name": "_owner", "type": "address"}],
+            "name": "balanceOf",
+            "outputs": [{"name": "balance", "type": "uint256"}],
+            "type": "function"
+        }]
+        
+        checksum_wallet = Web3.to_checksum_address(wallet_address)
+        
+        debt_positions = []
+        
+        for asset in chain_assets:
+            symbol = asset.get('symbol', 'UNKNOWN')
+            variable_debt_address = asset.get('variableDebtTokenAddress')
+            stable_debt_address = asset.get('stableDebtTokenAddress')
+            
+            # Skip if no debt tokens
+            if not variable_debt_address and not stable_debt_address:
+                continue
+            
+            variable_debt = 0
+            stable_debt = 0
+            
+            # Check variable debt
+            if variable_debt_address:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(variable_debt_address),
+                        abi=token_abi
+                    )
+                    variable_debt = contract.functions.balanceOf(checksum_wallet).call()
+                except Exception as e:
+                    logger.debug(f"Variable debt check failed for {symbol}: {e}")
+            
+            # Check stable debt
+            if stable_debt_address:
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(stable_debt_address),
+                        abi=token_abi
+                    )
+                    stable_debt = contract.functions.balanceOf(checksum_wallet).call()
+                except Exception as e:
+                    logger.debug(f"Stable debt check failed for {symbol}: {e}")
+            
+            total_debt = variable_debt + stable_debt
+            
+            if total_debt > 0:
+                decimals = asset.get('decimals', 18)
+                debt_human = total_debt / (10 ** decimals)
+                
+                debt_positions.append({
+                    'symbol': symbol,
+                    'variable_debt_token': variable_debt_address,
+                    'stable_debt_token': stable_debt_address,
+                    'variable_debt_raw': variable_debt,
+                    'stable_debt_raw': stable_debt,
+                    'total_debt_raw': total_debt,
+                    'total_debt_human': debt_human,
+                    'decimals': decimals
+                })
+        
+        # Get account data
+        account_data = portfolio_service.get_comprehensive_account_data(w3, chain, wallet_address)
+        
+        return {
+            "wallet_address": wallet_address,
+            "chain": chain,
+            "total_assets_checked": len(chain_assets),
+            "assets_with_debt_tokens": len([a for a in chain_assets if a.get('variableDebtTokenAddress') or a.get('stableDebtTokenAddress')]),
+            "debt_positions_found": len(debt_positions),
+            "debt_positions": debt_positions,
+            "account_data_total_debt_usd": account_data.get('total_debt_usd', 0) if account_data else 0,
+            "diagnosis": (
+                f"Found {len(debt_positions)} debt positions matching account data" 
+                if debt_positions and abs(sum(p['total_debt_human'] for p in debt_positions) * 1.0 - account_data.get('total_debt_usd', 0)) < 1000
+                else f"Found {len(debt_positions)} debt positions but account shows {account_data.get('total_debt_usd', 0)} USD debt - possible mismatch"
+            )
+        }
+        
+    except Exception as e:
+        logger.error(f"Check all debt error: {e}")
+        return {"error": str(e)}
+@router_v2.post("/portfolio/test-all-chains")
+async def test_all_chains(request: PortfolioRequest, db: Session = Depends(get_db)):
+    """Test all supported chains"""
+    try:
+        if not portfolio_service:
+            raise HTTPException(status_code=503, detail="Portfolio service not initialized")
+        
+        # Test all chains
+        all_chains = ['ethereum', 'polygon', 'avalanche', 'arbitrum', 'optimism', 
+                     'bnb', 'base', 'fantom', 'gnosis', 'celo']
+        
+        chain_status = {}
+        
+        for chain in all_chains:
+            try:
+                rpc_endpoint = portfolio_service.get_working_rpc(chain)
+                w3 = Web3(Web3.HTTPProvider(rpc_endpoint))
+                is_connected = w3.is_connected()
+                block_number = w3.eth.block_number if is_connected else 0
+                
+                chain_status[chain] = {
+                    "connected": is_connected,
+                    "block_number": block_number,
+                    "endpoint": rpc_endpoint if is_connected else "Failed"
+                }
+            except Exception as e:
+                chain_status[chain] = {
+                    "connected": False,
+                    "block_number": 0,
+                    "endpoint": f"Error: {str(e)[:100]}"
+                }
+        
+        return {
+            "wallet_address": request.wallet_address,
+            "chain_status": chain_status,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"All chains test error: {e}")
+        return {"error": str(e)}
+@router_v2.get("/portfolio/chains/info")
+async def get_chains_info():
+    """Get information about supported chains"""
+    if not portfolio_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    chains_info = {
+        'ethereum': {
+            'name': 'Ethereum Mainnet',
+            'aave_v3': True,
+            'pool_address': '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
+            'status': 'fully_supported'
+        },
+        'polygon': {
+            'name': 'Polygon PoS',
+            'aave_v3': True,
+            'pool_address': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+            'status': 'fully_supported'
+        },
+        'avalanche': {
+            'name': 'Avalanche C-Chain',
+            'aave_v3': True,
+            'pool_address': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+            'status': 'fully_supported'
+        },
+        'arbitrum': {
+            'name': 'Arbitrum One',
+            'aave_v3': True,
+            'pool_address': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+            'status': 'fully_supported'
+        },
+        'optimism': {
+            'name': 'Optimism',
+            'aave_v3': True,
+            'pool_address': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+            'status': 'fully_supported'
+        },
+        'base': {
+            'name': 'Base',
+            'aave_v3': True,
+            'pool_address': '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+            'status': 'fully_supported'
+        },
+        'bnb': {
+            'name': 'BNB Smart Chain',
+            'aave_v3': False,
+            'alternative_protocols': ['Venus Protocol', 'Radiant Capital'],
+            'status': 'not_supported',
+            'reason': 'No official Aave V3 deployment'
+        },
+        'fantom': {
+            'name': 'Fantom Opera',
+            'aave_v3': False,
+            'alternative_protocols': ['Geist Finance'],
+            'status': 'not_supported',
+            'reason': 'No official Aave V3 deployment'
+        },
+        'gnosis': {
+            'name': 'Gnosis Chain',
+            'aave_v3': False,
+            'status': 'not_supported',
+            'reason': 'Limited Aave V3 support'
+        },
+        'celo': {
+            'name': 'Celo',
+            'aave_v3': False,
+            'status': 'not_supported',
+            'reason': 'No official Aave V3 deployment'
+        }
+    }
+    
+    return {
+        'total_chains': len(chains_info),
+        'supported_chains': [k for k, v in chains_info.items() if v.get('aave_v3')],
+        'unsupported_chains': [k for k, v in chains_info.items() if not v.get('aave_v3')],
+        'chains': chains_info
+    }
+            
 __all__ = ['router_v1', 'router_v2', 'init_services']
-

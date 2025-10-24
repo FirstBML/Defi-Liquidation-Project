@@ -1,340 +1,284 @@
 """
-Portfolio Tracker Service
-Uses existing asset data from JSON file for real-time portfolio fetching
-Location: app/portfolio_tracker_service.py
+Script to Fetch COMPLETE Aave V3 Reserve Data
+Run this to create a proper JSON file with all aToken addresses
 """
 
-import logging
-import json
-import os
-from typing import Dict, List, Optional
-from datetime import datetime, timezone
-from sqlalchemy.orm import Session
 from web3 import Web3
+import json
+from datetime import datetime
+import os
 
-logger = logging.getLogger(__name__)
-
-class PortfolioTrackerService:
-    """Service layer for portfolio tracking using existing asset data"""
-    
-    def __init__(self, assets_data_file: str = "risk_cache/aave_v3_all_chains_assets_1760537286.json"):
-        """Initialize with existing asset data"""
-        self.assets_data = self._load_assets_data(assets_data_file)
-        self.rpc_endpoints = self._get_rpc_endpoints()
-        logger.info(f"Portfolio tracker initialized with {len(self.assets_data)} assets")
-    
-    def _load_assets_data(self, assets_data_file: str) -> Dict:
-        """Load asset data from JSON file"""
-        try:
-            # Try multiple possible locations
-            possible_paths = [
-                assets_data_file,
-                f"app/{assets_data_file}",
-                f"../{assets_data_file}",
-                "aave_v3_all_chains_assets_1760537286.json"
-            ]
-            
-            for path in possible_paths:
-                if os.path.exists(path):
-                    with open(path, 'r') as f:
-                        data = json.load(f)
-                        logger.info(f"Loaded asset data from {path}")
-                        return data
-            
-            logger.warning("Asset data file not found, using empty data")
-            return {'all_assets': {}}
-            
-        except Exception as e:
-            logger.error(f"Failed to load asset data: {e}")
-            return {'all_assets': {}}
-    
-    def _get_rpc_endpoints(self) -> Dict:
-        """Get RPC endpoints for all chains"""
-        return {
-            'ethereum': 'https://eth.llamarpc.com',
-            'polygon': 'https://polygon-rpc.com',
-            'avalanche': 'https://api.avax.network/ext/bc/C/rpc',
-            'arbitrum': 'https://arb1.arbitrum.io/rpc',
-            'optimism': 'https://mainnet.optimism.io',
-            'bnb': 'https://bsc-dataseed.binance.org',
-            'base': 'https://mainnet.base.org',
-            'fantom': 'https://rpc.ftm.tools',
-            'celo': 'https://forno.celo.org',
-        }
-    
-    def get_user_portfolio(
-        self, 
-        wallet_address: str,
-        chains: Optional[List[str]] = None
-    ) -> Dict:
-        """
-        Get real-time portfolio for a wallet address using existing asset data
-        
-        Args:
-            wallet_address: Ethereum address to scan
-            chains: Optional list of chains to scan
-        
-        Returns:
-            Portfolio data with positions and risk metrics
-        """
-        try:
-            if not self.assets_data.get('all_assets'):
-                return self._get_empty_portfolio(wallet_address)
-            
-            # Use chains from asset data if not specified
-            if not chains:
-                chains = list(self.assets_data['all_assets'].keys())
-            
-            portfolio_data = {}
-            total_collateral = 0
-            total_debt = 0
-            lowest_hf = float('inf')
-            chains_with_positions = []
-            
-            for chain in chains:
-                if chain in self.assets_data['all_assets']:
-                    chain_portfolio = self._get_chain_portfolio(wallet_address, chain)
-                    portfolio_data[chain] = chain_portfolio
-                    
-                    if chain_portfolio['has_positions']:
-                        chains_with_positions.append(chain)
-                        total_collateral += chain_portfolio['account_data']['total_collateral_usd']
-                        total_debt += chain_portfolio['account_data']['total_debt_usd']
-                        chain_hf = chain_portfolio['account_data']['health_factor']
-                        if chain_hf and chain_hf < lowest_hf:
-                            lowest_hf = chain_hf
-            
-            # Calculate overall risk
-            cross_chain_risk = self._calculate_cross_chain_risk(
-                portfolio_data, total_collateral, total_debt, lowest_hf
-            )
-            
-            return {
-                'wallet_address': wallet_address.lower(),
-                'fetch_timestamp': datetime.now(timezone.utc).isoformat(),
-                'chains_scanned': chains,
-                'portfolio_data': portfolio_data,
-                'total_metrics': {
-                    'total_collateral_usd': round(total_collateral, 2),
-                    'total_debt_usd': round(total_debt, 2),
-                    'total_net_worth_usd': round(total_collateral - total_debt, 2),
-                    'chains_with_positions': chains_with_positions,
-                    'lowest_health_factor': round(lowest_hf, 3) if lowest_hf != float('inf') else None,
-                    'highest_risk_chain': self._get_highest_risk_chain(portfolio_data)
-                },
-                'cross_chain_risk': cross_chain_risk
+# Aave V3 Pool contract ABI (just the getReservesList and getReserveData functions)
+POOL_ABI = [
+    {
+        "inputs": [],
+        "name": "getReservesList",
+        "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
+        "name": "getReserveData",
+        "outputs": [
+            {
+                "components": [
+                    {"internalType": "uint256", "name": "configuration", "type": "uint256"},
+                    {"internalType": "uint128", "name": "liquidityIndex", "type": "uint128"},
+                    {"internalType": "uint128", "name": "currentLiquidityRate", "type": "uint128"},
+                    {"internalType": "uint128", "name": "variableBorrowIndex", "type": "uint128"},
+                    {"internalType": "uint128", "name": "currentVariableBorrowRate", "type": "uint128"},
+                    {"internalType": "uint128", "name": "currentStableBorrowRate", "type": "uint128"},
+                    {"internalType": "uint40", "name": "lastUpdateTimestamp", "type": "uint40"},
+                    {"internalType": "uint16", "name": "id", "type": "uint16"},
+                    {"internalType": "address", "name": "aTokenAddress", "type": "address"},
+                    {"internalType": "address", "name": "stableDebtTokenAddress", "type": "address"},
+                    {"internalType": "address", "name": "variableDebtTokenAddress", "type": "address"},
+                    {"internalType": "address", "name": "interestRateStrategyAddress", "type": "address"},
+                    {"internalType": "uint128", "name": "accruedToTreasury", "type": "uint128"},
+                    {"internalType": "uint128", "name": "unbacked", "type": "uint128"},
+                    {"internalType": "uint128", "name": "isolationModeTotalDebt", "type": "uint128"}
+                ],
+                "internalType": "struct DataTypes.ReserveData",
+                "name": "",
+                "type": "tuple"
             }
-            
-        except Exception as e:
-            logger.error(f"Portfolio fetch error for {wallet_address}: {e}")
-            return self._get_empty_portfolio(wallet_address)
-    
-    def _get_chain_portfolio(self, wallet_address: str, chain: str) -> Dict:
-        """Get portfolio for a specific chain"""
-        try:
-            w3 = Web3(Web3.HTTPProvider(self.rpc_endpoints.get(chain)))
-            if not w3.is_connected():
-                return self._get_empty_chain_data(chain)
-            
-            # Get user account data from Aave pool
-            pool_address = self._get_pool_address(chain)
-            if not pool_address:
-                return self._get_empty_chain_data(chain)
-            
-            # Mock implementation - in production, you'd query the actual Aave contracts
-            # This returns sample data structure
-            return self._get_mock_chain_data(wallet_address, chain)
-            
-        except Exception as e:
-            logger.error(f"Chain portfolio error for {chain}: {e}")
-            return self._get_empty_chain_data(chain)
-    
-    def _get_mock_chain_data(self, wallet_address: str, chain: str) -> Dict:
-        """Get mock chain data (replace with actual Aave contract calls)"""
-        # This is where you'd implement actual Aave V3 contract interactions
-        # For now, returning mock data structure
-        
-        import random
-        
-        # Simulate having positions 30% of the time
-        has_positions = random.random() < 0.3
-        
-        if not has_positions:
-            return self._get_empty_chain_data(chain)
-        
-        # Mock portfolio data
-        collateral_usd = random.uniform(1000, 50000)
-        debt_usd = random.uniform(100, collateral_usd * 0.7)
-        health_factor = (collateral_usd * 0.75) / debt_usd if debt_usd > 0 else float('inf')
-        
-        # Get assets for this chain from our data
-        chain_assets = self.assets_data['all_assets'].get(chain, [])
-        assets_breakdown = []
-        
-        if chain_assets:
-            # Pick 1-3 random assets for this portfolio
-            num_assets = min(random.randint(1, 3), len(chain_assets))
-            selected_assets = random.sample(chain_assets, num_assets)
-            
-            for asset in selected_assets:
-                assets_breakdown.append({
-                    'symbol': asset.get('symbol', 'UNKNOWN'),
-                    'address': asset.get('address'),
-                    'collateral_balance': random.uniform(0.1, 10),
-                    'debt_balance': random.uniform(0, 5),
-                    'collateral_usd': random.uniform(100, 5000),
-                    'debt_usd': random.uniform(0, 2000)
-                })
-        
-        return {
-            'has_positions': True,
-            'account_data': {
-                'total_collateral_usd': round(collateral_usd, 2),
-                'total_debt_usd': round(debt_usd, 2),
-                'health_factor': round(health_factor, 3),
-                'risk_level': self._get_risk_level(health_factor)
-            },
-            'assets': assets_breakdown
-        }
-    
-    def _get_pool_address(self, chain: str) -> Optional[str]:
-        """Get Aave V3 pool address for chain"""
-        pool_addresses = {
-            'ethereum': '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
-            'polygon': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-            'avalanche': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-            'arbitrum': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-            'optimism': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-            'bnb': '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
-            'base': '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
-            'fantom': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-            'celo': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
-        }
-        return pool_addresses.get(chain)
-    
-    def _get_risk_level(self, health_factor: float) -> str:
-        """Convert health factor to risk level"""
-        if health_factor == float('inf'):
-            return 'NO_DEBT'
-        elif health_factor < 1.0:
-            return 'LIQUIDATION_IMMINENT'
-        elif health_factor < 1.1:
-            return 'CRITICAL'
-        elif health_factor < 1.5:
-            return 'HIGH_RISK'
-        elif health_factor < 2.0:
-            return 'MEDIUM_RISK'
-        else:
-            return 'LOW_RISK'
-    
-    def _calculate_cross_chain_risk(self, portfolio_data: Dict, total_collateral: float, 
-                                  total_debt: float, lowest_hf: float) -> Dict:
-        """Calculate cross-chain risk assessment"""
-        risky_chains = []
-        safe_chains = []
-        
-        for chain, data in portfolio_data.items():
-            if data.get('has_positions'):
-                hf = data['account_data']['health_factor']
-                if hf and hf < 1.5:
-                    risky_chains.append(chain)
-                else:
-                    safe_chains.append(chain)
-        
-        overall_risk = 'UNKNOWN'
-        if total_debt == 0:
-            overall_risk = 'NO_DEBT'
-        elif lowest_hf < 1.0:
-            overall_risk = 'CRITICAL'
-        elif lowest_hf < 1.5:
-            overall_risk = 'HIGH'
-        elif lowest_hf < 2.0:
-            overall_risk = 'MEDIUM'
-        else:
-            overall_risk = 'LOW'
-        
-        return {
-            'overall_risk_level': overall_risk,
-            'riskiest_chain': risky_chains[0] if risky_chains else None,
-            'safest_chain': safe_chains[0] if safe_chains else None,
-            'risky_chains_count': len(risky_chains),
-            'recommendations': self._generate_recommendations(overall_risk, risky_chains)
-        }
-    
-    def _generate_recommendations(self, risk_level: str, risky_chains: List[str]) -> List[str]:
-        """Generate risk mitigation recommendations"""
-        recommendations = []
-        
-        if risk_level == 'CRITICAL':
-            recommendations.append("IMMEDIATE ACTION REQUIRED: Add collateral or repay debt to avoid liquidation")
-        elif risk_level == 'HIGH':
-            recommendations.append("High risk detected: Consider adding collateral across all chains")
-        
-        if risky_chains:
-            recommendations.append(f"Focus on chains: {', '.join(risky_chains)}")
-        
-        if not recommendations:
-            recommendations.append("Portfolio appears healthy. Monitor regularly.")
-        
-        return recommendations
-    
-    def _get_highest_risk_chain(self, portfolio_data: Dict) -> Optional[str]:
-        """Find chain with highest risk (lowest health factor)"""
-        highest_risk_chain = None
-        lowest_hf = float('inf')
-        
-        for chain, data in portfolio_data.items():
-            if data.get('has_positions'):
-                hf = data['account_data']['health_factor']
-                if hf and hf < lowest_hf:
-                    lowest_hf = hf
-                    highest_risk_chain = chain
-        
-        return highest_risk_chain
-    
-    def _get_empty_portfolio(self, wallet_address: str) -> Dict:
-        """Return empty portfolio structure"""
-        return {
-            'wallet_address': wallet_address.lower(),
-            'fetch_timestamp': datetime.now(timezone.utc).isoformat(),
-            'chains_scanned': [],
-            'portfolio_data': {},
-            'total_metrics': {
-                'total_collateral_usd': 0,
-                'total_debt_usd': 0,
-                'total_net_worth_usd': 0,
-                'chains_with_positions': [],
-                'lowest_health_factor': None,
-                'highest_risk_chain': None
-            },
-            'cross_chain_risk': {
-                'overall_risk_level': 'NO_POSITIONS',
-                'riskiest_chain': None,
-                'safest_chain': None,
-                'risky_chains_count': 0,
-                'recommendations': ['No Aave positions found']
-            }
-        }
-    
-    def _get_empty_chain_data(self, chain: str) -> Dict:
-        """Return empty chain data structure"""
-        return {
-            'has_positions': False,
-            'account_data': {
-                'total_collateral_usd': 0,
-                'total_debt_usd': 0,
-                'health_factor': None,
-                'risk_level': 'NO_POSITIONS'
-            },
-            'assets': []
-        }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
 
-    # Keep the existing methods for risk monitoring
-    def check_address_risk_changes(self, db: Session, monitored_address_id: int, wallet_address: str) -> Dict:
-        """Check for risk changes - same as before but using real portfolio data"""
-        from app.db_models import PositionSnapshot
+# Get configuration (for LTV, liquidation threshold, etc.)
+POOL_DATA_PROVIDER_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
+        "name": "getReserveConfigurationData",
+        "outputs": [
+            {"internalType": "uint256", "name": "decimals", "type": "uint256"},
+            {"internalType": "uint256", "name": "ltv", "type": "uint256"},
+            {"internalType": "uint256", "name": "liquidationThreshold", "type": "uint256"},
+            {"internalType": "uint256", "name": "liquidationBonus", "type": "uint256"},
+            {"internalType": "uint256", "name": "reserveFactor", "type": "uint256"},
+            {"internalType": "bool", "name": "usageAsCollateralEnabled", "type": "bool"},
+            {"internalType": "bool", "name": "borrowingEnabled", "type": "bool"},
+            {"internalType": "bool", "name": "stableBorrowRateEnabled", "type": "bool"},
+            {"internalType": "bool", "name": "isActive", "type": "bool"},
+            {"internalType": "bool", "name": "isFrozen", "type": "bool"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+# ERC20 for getting symbol/name
+ERC20_ABI = [
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "name",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
+        "type": "function"
+    }
+]
+
+# Aave V3 addresses for ALL chains
+AAVE_ADDRESSES = {
+    'ethereum': {
+        'pool': '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2',
+        'pool_data_provider': '0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3',
+        'rpc': 'https://eth.llamarpc.com'
+    },
+    'polygon': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://polygon-rpc.com'
+    },
+    'avalanche': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://api.avax.network/ext/bc/C/rpc'
+    },
+    'arbitrum': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://arb1.arbitrum.io/rpc'
+    },
+    'optimism': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://mainnet.optimism.io'
+    },
+    'bnb': {
+        'pool': '0x6807dc923806fE8Fd134338EABCA509979a7e0cB',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://bsc-dataseed.binance.org'
+    },
+    'base': {
+        'pool': '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://mainnet.base.org'
+    },
+    'fantom': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://rpc.ftm.tools'
+    },
+    'gnosis': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://rpc.gnosischain.com'
+    },
+    'celo': {
+        'pool': '0x794a61358D6845594F94dc1DB02A252b5b4814aD',
+        'pool_data_provider': '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654',
+        'rpc': 'https://forno.celo.org'
+    }
+}
+
+def fetch_complete_reserve_data(chain_name, chain_config):
+    """Fetch complete reserve data for a chain"""
+    print(f"\n📊 Fetching {chain_name}...")
+    
+    try:
+        # Connect to Web3
+        w3 = Web3(Web3.HTTPProvider(chain_config['rpc']))
+        if not w3.is_connected():
+            print(f"❌ Failed to connect to {chain_name}")
+            return []
         
-        current_portfolio = self.get_user_portfolio(wallet_address)
+        # Get contracts
+        pool = w3.eth.contract(
+            address=Web3.to_checksum_address(chain_config['pool']),
+            abi=POOL_ABI
+        )
         
-        # Rest of the method remains the same as your original implementation
-        # ... [keep the existing check_address_risk_changes implementation]
+        pool_data_provider = w3.eth.contract(
+            address=Web3.to_checksum_address(chain_config['pool_data_provider']),
+            abi=POOL_DATA_PROVIDER_ABI
+        )
+        
+        # Get list of all reserves
+        reserve_addresses = pool.functions.getReservesList().call()
+        print(f"   Found {len(reserve_addresses)} reserves")
+        
+        reserves = []
+        
+        for i, address in enumerate(reserve_addresses):
+            try:
+                print(f"   Processing {i+1}/{len(reserve_addresses)}: {address[:10]}...")
+                
+                # Get basic token info
+                token = w3.eth.contract(address=address, abi=ERC20_ABI)
+                try:
+                    symbol = token.functions.symbol().call()
+                    name = token.functions.name().call()
+                    decimals = token.functions.decimals().call()
+                except:
+                    symbol = "UNKNOWN"
+                    name = "Unknown Token"
+                    decimals = 18
+                
+                # Get reserve data (includes aToken addresses)
+                reserve_data = pool.functions.getReserveData(address).call()
+                
+                # Get configuration (LTV, liquidation threshold, etc.)
+                config = pool_data_provider.functions.getReserveConfigurationData(address).call()
+                
+                reserve_info = {
+                    'chain': chain_name,
+                    'address': address.lower(),
+                    'symbol': symbol,
+                    'name': name,
+                    'decimals': decimals,
+                    # CRITICAL: These are the missing fields!
+                    'aTokenAddress': reserve_data[8].lower(),
+                    'stableDebtTokenAddress': reserve_data[9].lower(),
+                    'variableDebtTokenAddress': reserve_data[10].lower(),
+                    'liquidityRate': reserve_data[2],
+                    'variableBorrowRate': reserve_data[4],
+                    'stableBorrowRate': reserve_data[5],
+                    'liquidityIndex': reserve_data[1],
+                    'variableBorrowIndex': reserve_data[3],
+                    'lastUpdateTimestamp': reserve_data[6],
+                    # Configuration
+                    'ltv': config[1] / 10000,  # Convert basis points to decimal
+                    'liquidationThreshold': config[2] / 10000,
+                    'liquidationBonus': config[3] / 10000,
+                    'usageAsCollateralEnabled': config[5],
+                    'borrowingEnabled': config[6],
+                    'stableBorrowRateEnabled': config[7],
+                    'isActive': config[8],
+                    'isFrozen': config[9]
+                }
+                
+                reserves.append(reserve_info)
+                print(f"      ✅ {symbol}")
+                
+            except Exception as e:
+                print(f"      ❌ Error: {e}")
+                continue
+        
+        return reserves
+        
+    except Exception as e:
+        print(f"❌ Chain error: {e}")
+        return []
+
+def main():
+    """Fetch complete data for all chains"""
+    print("🚀 Fetching COMPLETE Aave V3 Reserve Data for ALL Chains...")
+    print("=" * 60)
+    
+    all_data = {}
+    total_reserves = 0
+    
+    for chain_name, chain_config in AAVE_ADDRESSES.items():
+        reserves = fetch_complete_reserve_data(chain_name, chain_config)
+        all_data[chain_name] = reserves
+        total_reserves += len(reserves)
+        print(f"✅ {chain_name}: {len(reserves)} reserves")
+    
+    # Save to the specific file path
+    output_path = r"C:\Users\g\Documents\LiquidationProject\app\aave_v3_complete_data_1761094969.json"
+    
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    output = {
+        'fetch_timestamp': int(datetime.now().timestamp()),
+        'total_chains': len(AAVE_ADDRESSES),
+        'total_reserves': total_reserves,
+        'data': all_data
+    }
+    
+    with open(output_path, 'w') as f:
+        json.dump(output, f, indent=2)
+    
+    print("\n" + "=" * 60)
+    print(f"✅ Complete! Saved to: {output_path}")
+    print(f"📊 Total chains: {len(AAVE_ADDRESSES)}")
+    print(f"📊 Total reserves: {total_reserves}")
+    print("\nChains processed:")
+    for chain_name in AAVE_ADDRESSES.keys():
+        reserve_count = len(all_data.get(chain_name, []))
+        print(f"   • {chain_name}: {reserve_count} reserves")
+    
+    print("\nNow update your portfolio_tracker_service.py to use this file!")
+
+if __name__ == "__main__":
+    main()

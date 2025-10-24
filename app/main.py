@@ -21,6 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+logging.getLogger('app.portfolio_tracker_service').setLevel(logging.DEBUG)
 # Suppress warnings
 warnings.filterwarnings('ignore', module='eth_utils')
 
