@@ -1,0 +1,45 @@
+[
+  {
+    "endpoint": "/",
+    "status": "ERROR",
+    "success": false,
+    "error": "HTTPSConnectionPool(host='easygoing-charm-production-707b.up.railway.app', port=443): Max retries exceeded with url: / (Caused by ConnectTimeoutError(<urllib3.connection.HTTPSConnection object at 0x000002A42A83FB60>, 'Connection to easygoing-charm-production-707b.up.railway.app timed out. (connect timeout=10)'))",
+    "time": "22:39:33"
+  },
+  {
+    "endpoint": "/health",
+    "status": 200,
+    "success": true,
+    "time": "22:39:36"
+  },
+  {
+    "endpoint": "/startup-status",
+    "status": 500,
+    "success": false,
+    "time": "22:39:38"
+  },
+  {
+    "endpoint": "/docs",
+    "status": 200,
+    "success": true,
+    "time": "22:39:40"
+  },
+  {
+    "endpoint": "/openapi.json",
+    "status": 200,
+    "success": true,
+    "time": "22:39:48"
+  },
+  {
+    "endpoint": "/api/v1/reserves",
+    "status": 404,
+    "success": false,
+    "time": "22:39:50"
+  },
+  {
+    "endpoint": "/api/v2/reserves",
+    "status": 404,
+    "success": false,
+    "time": "22:39:54"
+  }
+]

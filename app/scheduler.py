@@ -1,5 +1,5 @@
 """
-Unified Scheduler - FIXED PORT CONFIGURATION
+Unified Scheduler - FIXED VERSION
 Location: app/scheduler.py
 """
 
@@ -11,6 +11,7 @@ import logging
 import os
 from typing import Optional
 import requests
+from sqlalchemy import func  # FIXED: Import func from sqlalchemy
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ class UnifiedScheduler:
         self.scheduler = BackgroundScheduler()
         self.running = False
         
-        # FIXED: Get the correct port from environment
+        # Get the correct port from environment
         self.api_port = int(os.getenv('PORT', '8080'))
         self.api_base_url = f"http://localhost:{self.api_port}"
         
@@ -125,8 +126,12 @@ class UnifiedScheduler:
         logger.info("🔄 Starting full data refresh...")
         
         try:
+            # Get admin password from environment
+            admin_password = os.getenv("ADMIN_PASSWORD", "change_me_in_production")
+            
             response = requests.post(
                 f"{self.api_base_url}/api/data/refresh",
+                params={"password": admin_password},  # FIXED: Add password param
                 json={
                     "refresh_reserves": True,
                     "refresh_positions": True,
@@ -141,7 +146,7 @@ class UnifiedScheduler:
                 logger.info("✅ Full data refresh completed successfully")
                 logger.info(f"   Summary: {result.get('summary', {})}")
             else:
-                logger.error(f"❌ Full refresh failed: {response.status_code}")
+                logger.error(f"❌ Full refresh failed: {response.status_code} - {response.text}")
                 
         except requests.exceptions.Timeout:
             logger.error("❌ Full refresh timed out (>5 minutes)")
@@ -153,8 +158,12 @@ class UnifiedScheduler:
         logger.info("💰 Starting price update...")
         
         try:
+            # Get admin password from environment
+            admin_password = os.getenv("ADMIN_PASSWORD", "change_me_in_production")
+            
             response = requests.post(
                 f"{self.api_base_url}/api/data/refresh",
+                params={"password": admin_password},  # FIXED: Add password param
                 json={"prices_only": True},
                 timeout=120
             )
@@ -233,31 +242,32 @@ class UnifiedScheduler:
             # Get current metrics
             total_positions = db.query(Position).count()
             risky_positions = db.query(Position).filter(
-                Position.enhanced_health_factor < 1.5
+                Position.enhanced_health_factor < 1.5,
+                Position.enhanced_health_factor > 0
             ).count()
             
+            # FIXED: Use func from sqlalchemy, not db.func
             total_collateral = db.query(
-                Position
-            ).with_entities(
-                db.func.sum(Position.total_collateral_usd)
+                func.sum(Position.total_collateral_usd)
             ).scalar() or 0
             
             total_debt = db.query(
-                Position
-            ).with_entities(
-                db.func.sum(Position.total_debt_usd)
+                func.sum(Position.total_debt_usd)
             ).scalar() or 0
+            
+            # Calculate health score
+            health_score = self._calculate_health_score(
+                total_positions, risky_positions, total_collateral, total_debt
+            )
             
             # Store snapshot
             snapshot = AnalysisSnapshot(
                 snapshot_time=datetime.now(timezone.utc),
                 total_positions=total_positions,
                 risky_positions=risky_positions,
-                total_collateral_usd=total_collateral,
-                total_debt_usd=total_debt,
-                protocol_health_score=self._calculate_health_score(
-                    total_positions, risky_positions, total_collateral, total_debt
-                )
+                total_collateral_usd=float(total_collateral),
+                total_debt_usd=float(total_debt),
+                protocol_health_score=float(health_score)
             )
             
             db.add(snapshot)
@@ -267,22 +277,26 @@ class UnifiedScheduler:
             logger.info(f"✅ Protocol analysis completed")
             logger.info(f"   Positions: {total_positions} (risky: {risky_positions})")
             logger.info(f"   TVL: ${total_collateral:,.0f}, Debt: ${total_debt:,.0f}")
+            logger.info(f"   Health Score: {health_score:.1f}/100")
             
         except Exception as e:
             logger.error(f"❌ Protocol analysis error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _quick_health_check(self):
         """Quick system health check"""
         logger.info("❤️  Running quick health check...")
         
         try:
-            from .db_models import SessionLocal, engine
+            from .db_models import SessionLocal
+            from sqlalchemy import text
             
             # Check database
             db_healthy = False
             try:
                 db = SessionLocal()
-                db.execute("SELECT 1")
+                db.execute(text("SELECT 1"))
                 db.close()
                 db_healthy = True
             except Exception as db_error:

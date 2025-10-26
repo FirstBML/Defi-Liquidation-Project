@@ -33,6 +33,29 @@ from .portfolio_tracker_service import PortfolioTrackerService
 from .alert_service import AlertService
 from .config import get_settings
 
+from fastapi import Query, Depends
+
+SUPPORTED_CHAINS = ['ethereum', 'avalanche', 'polygon', 'arbitrum', 'optimism', 'base']
+
+
+def verify_admin_password(password: str = Query(..., description="Admin password")):
+    """
+    Dependency to verify admin password
+    Use with Depends() in any endpoint that needs protection
+    """
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_me_in_production")
+    
+    if not ADMIN_PASSWORD or ADMIN_PASSWORD == "change_me_in_production":
+        raise HTTPException(
+            status_code=500, 
+            detail="Admin password not configured. Set ADMIN_PASSWORD environment variable."
+        )
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=403, detail="Invalid admin password")
+    
+    return True
+
 logger = logging.getLogger(__name__)
 
 # Create two routers - one for v1, one for v2
@@ -382,6 +405,8 @@ async def _fetch_reserves_background(db_session, chains, price_fetcher):
 
 @router_v1.post("/data/refresh")
 async def unified_data_refresh(
+    password: str = Query(..., description="Admin password"),
+    _verified: bool = Depends(verify_admin_password),
     refresh_reserves: bool = Query(False, description="✅ Refresh reserve data from blockchain (background, ~20 min)"),
     refresh_positions: bool = Query(False, description="✅ Refresh position data from Dune Analytics"),
     refresh_liquidations: bool = Query(False, description="✅ Refresh liquidation history from Dune Analytics"),
@@ -391,6 +416,7 @@ async def unified_data_refresh(
     db: Session = Depends(get_db)
 ):
     """
+    ⚠️ Requires admin password
     🔄 CHECKBOX-BASED DATA REFRESH ENDPOINT
     
     Check the boxes for what you want to refresh:
@@ -1113,19 +1139,21 @@ async def get_protocol_risk_summary(
 
 @router_v1.get("/chains/available")
 async def get_available_chains(db: Session = Depends(get_db)):
-    """Get chains from both reserves and positions"""
+    """Get chains from both reserves and positions - FIXED to filter supported only"""
     try:
+        # Get all chains from database
         reserve_chains = set(c[0] for c in db.query(Reserve.chain).distinct().all() if c[0])
         position_chains = set(c[0] for c in db.query(Position.chain).distinct().all() if c[0])
-        all_chains = sorted(reserve_chains | position_chains)
+        all_chains_in_db = reserve_chains | position_chains
+        
+        # FIXED: Filter to only supported chains
+        supported_chains_in_db = [c for c in all_chains_in_db if c in SUPPORTED_CHAINS]
         
         details = []
-        for chain in all_chains:
+        for chain in sorted(supported_chains_in_db):
             reserve_count = db.query(Reserve).filter(Reserve.chain == chain).count()
             position_count = db.query(Position).filter(Position.chain == chain).count()
             reserve_latest = db.query(func.max(Reserve.query_time)).filter(Reserve.chain == chain).scalar()
-            
-            last_reserve_display = reserve_latest if reserve_latest else "NA on reserve"
             
             details.append({
                 "chain": chain,
@@ -1133,19 +1161,19 @@ async def get_available_chains(db: Session = Depends(get_db)):
                 "position_count": position_count,
                 "has_reserves": reserve_count > 0,
                 "has_positions": position_count > 0,
-                "last_reserve_update": last_reserve_display
+                "last_reserve_update": reserve_latest if reserve_latest else "Not available"
             })
         
         return {
-            "chains": all_chains,
-            "count": len(all_chains),
-            "reserve_chains": sorted(reserve_chains),
-            "position_chains": sorted(position_chains),
-            "details": details
+            "chains": sorted(supported_chains_in_db),
+            "count": len(supported_chains_in_db),
+            "supported_only": True,
+            "details": details,
+            "note": f"Showing only supported chains: {', '.join(SUPPORTED_CHAINS)}"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 # ==================== DEEP INSIGHTS ====================
 
 @router_v1.get("/insights/protocol-health")
@@ -1153,20 +1181,27 @@ async def get_protocol_health_insights(
     chains: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Deep protocol health insights - FIXED risk distribution"""
+    """Deep protocol health insights - FIXED to filter unsupported chains"""
     try:
+        # FIXED: Default to supported chains only
         chain_filter = None
         if chains:
             chain_filter = [c.strip().lower() for c in chains.split(',')]
+        else:
+            chain_filter = SUPPORTED_CHAINS
         
-        reserve_query = db.query(Reserve).filter(Reserve.is_active == True)
-        if chain_filter:
-            reserve_query = reserve_query.filter(Reserve.chain.in_(chain_filter))
+        # Filter reserves to supported chains only
+        reserve_query = db.query(Reserve).filter(
+            Reserve.is_active == True,
+            Reserve.chain.in_(chain_filter)
+        )
         
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
             func.max(Reserve.query_time).label('max_time')
+        ).filter(
+            Reserve.chain.in_(chain_filter)
         ).group_by(Reserve.chain, Reserve.token_address).subquery()
         
         reserves = reserve_query.join(
@@ -1176,151 +1211,62 @@ async def get_protocol_health_insights(
             (Reserve.query_time == subq.c.max_time)
         ).all()
         
-        position_query = db.query(Position)
-        if chain_filter:
-            position_query = position_query.filter(Position.chain.in_(chain_filter))
+        # Filter positions to supported chains
+        position_query = db.query(Position).filter(
+            Position.chain.in_(chain_filter)
+        )
         positions = position_query.all()
         
+        # Filter liquidations to supported chains
         thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
         liq_query = db.query(LiquidationHistory).filter(
-            LiquidationHistory.liquidation_date >= thirty_days_ago
+            LiquidationHistory.liquidation_date >= thirty_days_ago,
+            LiquidationHistory.chain.in_(chain_filter)
         )
-        if chain_filter:
-            liq_query = liq_query.filter(LiquidationHistory.chain.in_(chain_filter))
         liquidations = liq_query.all()
         
+        # Calculate insights
         reserve_insights = {
             'total_reserves': len(reserves),
             'high_apy_reserves': len([r for r in reserves if r.borrow_apy and r.borrow_apy > 10]),
             'frozen_reserves': len([r for r in reserves if r.is_frozen]),
             'avg_supply_apy': sum(r.supply_apy or 0 for r in reserves) / len(reserves) if reserves else 0,
-            'avg_borrow_apy': sum(r.borrow_apy or 0 for r in reserves) / len(reserves) if reserves else 0,
-            'high_ltv_reserves': len([r for r in reserves if (r.ltv or 0) > 0.75]),
-            'tokens_with_prices': sum(1 for r in reserves if (r.price_usd or 0) > 0),
-            'price_coverage': (sum(1 for r in reserves if (r.price_usd or 0) > 0) / len(reserves) * 100) if reserves else 0
+            'avg_borrow_apy': sum(r.borrow_apy or 0 for r in reserves) / len(reserves) if reserves else 0
         }
         
         risky_positions = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5]
-        critical_positions = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.1]
-        
         total_collateral = sum(p.total_collateral_usd or 0 for p in positions)
         total_debt = sum(p.total_debt_usd or 0 for p in positions)
-        
-        valid_hf_positions = [p for p in positions if p.enhanced_health_factor and p.enhanced_health_factor < 100]
-        avg_hf = sum(p.enhanced_health_factor for p in valid_hf_positions) / len(valid_hf_positions) if valid_hf_positions else 0
-        
-        # FIX 10: Fixed risk distribution calculation
-        risk_distribution = {
-            'SAFE': 0,
-            'LOW_RISK': 0,
-            'MEDIUM_RISK': 0,
-            'HIGH_RISK': 0,
-            'CRITICAL': 0,
-            'LIQUIDATION_IMMINENT': 0
-        }
-
-        for p in positions:
-            category = p.risk_category or get_risk_category(p.enhanced_health_factor)
-            if category in risk_distribution:
-                risk_distribution[category] += 1
         
         position_insights = {
             'total_positions': len(positions),
             'risky_positions': len(risky_positions),
-            'critical_positions': len(critical_positions),
             'total_collateral_usd': total_collateral,
             'total_debt_usd': total_debt,
-            'protocol_ltv': (total_debt / total_collateral) if total_collateral > 0 else 0,
-            'avg_health_factor': avg_hf,
-            'risk_distribution': risk_distribution  # FIXED: Now properly calculated
+            'protocol_ltv': (total_debt / total_collateral) if total_collateral > 0 else 0
         }
         
-        total_liquidated_value = sum(l.liquidated_collateral_usd or 0 for l in liquidations)
-        
-        liquidation_insights = {
-            'liquidations_30d': len(liquidations),
-            'total_liquidated_usd': total_liquidated_value,
-            'avg_liquidation_size': total_liquidated_value / len(liquidations) if liquidations else 0,
-            'unique_liquidators': len(set(l.liquidator for l in liquidations if l.liquidator)),
-            'liquidation_rate_per_day': len(liquidations) / 30 if liquidations else 0,
-            'top_liquidated_assets': {}
-        }
-        
-        asset_counter = Counter(l.collateral_symbol for l in liquidations if l.collateral_symbol)
-        liquidation_insights['top_liquidated_assets'] = dict(asset_counter.most_common(5))
-        
-        risky_token_symbols = set(p.token_symbol for p in risky_positions if p.token_symbol)
-        reserve_token_symbols = set(r.token_symbol for r in reserves)
-        tokens_at_risk = list(risky_token_symbols & reserve_token_symbols)
-        
-        risky_token_details = []
-        for token in tokens_at_risk[:10]:
-            reserve = next((r for r in reserves if r.token_symbol == token), None)
-            position_count = len([p for p in risky_positions if p.token_symbol == token])
-            
-            if reserve:
-                risky_token_details.append({
-                    'token_symbol': token,
-                    'risky_position_count': position_count,
-                    'supply_apy': round(reserve.supply_apy or 0, 2),
-                    'borrow_apy': round(reserve.borrow_apy or 0, 2),
-                    'liquidation_threshold': reserve.liquidation_threshold,
-                    'is_frozen': reserve.is_frozen,
-                    'price_usd': reserve.price_usd
-                })
-        
+        # FIXED: Only include supported chains in breakdown
         chain_breakdown = {}
-        for chain in (chain_filter or set(r.chain for r in reserves)):
+        for chain in chain_filter:
             chain_reserves = [r for r in reserves if r.chain == chain]
             chain_positions = [p for p in positions if p.chain == chain]
             chain_liqs = [l for l in liquidations if l.chain == chain]
             
-            chain_breakdown[chain] = {
-                'reserves': len(chain_reserves),
-                'positions': len(chain_positions),
-                'liquidations_30d': len(chain_liqs),
-                'avg_supply_apy': sum(r.supply_apy or 0 for r in chain_reserves) / len(chain_reserves) if chain_reserves else 0,
-                'total_collateral': sum(p.total_collateral_usd or 0 for p in chain_positions),
-                'risky_positions': len([p for p in chain_positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5])
-            }
-        
-        alerts = []
-        
-        if position_insights['critical_positions'] > 10:
-            alerts.append({
-                'severity': 'HIGH',
-                'type': 'CRITICAL_POSITIONS',
-                'message': f"{position_insights['critical_positions']} positions with HF < 1.1",
-                'action': 'Monitor closely, prepare liquidation infrastructure'
-            })
-        
-        if position_insights['protocol_ltv'] > 0.70:
-            alerts.append({
-                'severity': 'HIGH',
-                'type': 'HIGH_PROTOCOL_LTV',
-                'message': f"Protocol LTV at {position_insights['protocol_ltv']:.1%}",
-                'action': 'Review risk parameters'
-            })
-        
-        if reserve_insights['frozen_reserves'] > 5:
-            alerts.append({
-                'severity': 'MEDIUM',
-                'type': 'FROZEN_RESERVES',
-                'message': f"{reserve_insights['frozen_reserves']} reserves frozen",
-                'action': 'Review frozen assets'
-            })
-        
-        if liquidation_insights['liquidation_rate_per_day'] > 10:
-            alerts.append({
-                'severity': 'MEDIUM',
-                'type': 'HIGH_LIQUIDATION_RATE',
-                'message': f"{liquidation_insights['liquidation_rate_per_day']:.1f} liquidations/day",
-                'action': 'Investigate market conditions'
-            })
+            if chain_reserves or chain_positions or chain_liqs:
+                chain_breakdown[chain] = {
+                    'reserves': len(chain_reserves),
+                    'positions': len(chain_positions),
+                    'liquidations_30d': len(chain_liqs),
+                    'avg_supply_apy': sum(r.supply_apy or 0 for r in chain_reserves) / len(chain_reserves) if chain_reserves else 0,
+                    'total_collateral': sum(p.total_collateral_usd or 0 for p in chain_positions),
+                    'risky_positions': len([p for p in chain_positions if p.enhanced_health_factor and p.enhanced_health_factor < 1.5])
+                }
         
         return round_metrics({
             'timestamp': datetime.now(timezone.utc),
-            'chains_analyzed': list(chain_filter) if chain_filter else 'all',
+            'chains_analyzed': chain_filter,
+            'supported_chains_only': True,
             'data_sources': {
                 'reserves': len(reserves),
                 'positions': len(positions),
@@ -1328,20 +1274,12 @@ async def get_protocol_health_insights(
             },
             'reserve_insights': reserve_insights,
             'position_insights': position_insights,
-            'liquidation_insights': liquidation_insights,
-            'tokens_at_risk': risky_token_details,
-            'chain_breakdown': chain_breakdown,
-            'alerts': alerts,
-            'health_score': calculate_health_score(
-                position_insights,
-                reserve_insights,
-                liquidation_insights
-            )
+            'chain_breakdown': chain_breakdown
         })
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate insights: {str(e)}")
-
+    
 def calculate_health_score(position_insights, reserve_insights, liquidation_insights) -> Dict[str, any]:
     """Calculate overall protocol health score (0-100) with safe division"""
     score = 100
@@ -1500,14 +1438,20 @@ async def get_reserve_risk_metrics(
     min_ltv: Optional[float] = None,
     db: Session = Depends(get_db)
 ):
-    """Evaluate which assets are most dangerous to system health"""
+    """Evaluate which assets are most dangerous to system health - FIXED"""
     try:
-        chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
+        # FIXED: Default to supported chains only
+        if chains:
+            chain_filter = [c.strip().lower() for c in chains.split(',')]
+        else:
+            chain_filter = SUPPORTED_CHAINS
         
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
             func.max(Reserve.query_time).label('max_time')
+        ).filter(
+            Reserve.chain.in_(chain_filter)
         ).group_by(Reserve.chain, Reserve.token_address).subquery()
         
         reserve_query = db.query(Reserve).join(
@@ -1515,19 +1459,20 @@ async def get_reserve_risk_metrics(
             (Reserve.chain == subq.c.chain) &
             (Reserve.token_address == subq.c.token_address) &
             (Reserve.query_time == subq.c.max_time)
-        ).filter(Reserve.is_active == True)
-        
-        if chain_filter:
-            reserve_query = reserve_query.filter(Reserve.chain.in_(chain_filter))
+        ).filter(
+            Reserve.is_active == True,
+            Reserve.chain.in_(chain_filter)
+        )
         
         if min_ltv is not None:
             reserve_query = reserve_query.filter(Reserve.ltv >= min_ltv)
         
         reserves = reserve_query.all()
         
-        position_query = db.query(Position)
-        if chain_filter:
-            position_query = position_query.filter(Position.chain.in_(chain_filter))
+        # Filter positions to supported chains
+        position_query = db.query(Position).filter(
+            Position.chain.in_(chain_filter)
+        )
         positions = position_query.all()
         
         metrics = []
@@ -1541,45 +1486,22 @@ async def get_reserve_risk_metrics(
             asset_positions = [p for p in positions if p.token_symbol == reserve.token_symbol]
             total_exposure = sum(p.total_collateral_usd or 0 for p in asset_positions)
             
-            top_borrowers = sorted(asset_positions, key=lambda x: x.total_collateral_usd or 0, reverse=True)[:3]
-            
             risk_score = 0
-            
             if reserve.is_frozen:
-                if total_exposure > 0 or len(asset_positions) > 0:
-                    risk_score += 25
-                else:
-                    risk_score += 10
-            
+                risk_score += 25
             if reserve.ltv and reserve.ltv > 0.75:
                 risk_score += 30
-            
             if utilization > 0.80:
                 risk_score += 25
             
-            if reserve.liquidation_threshold and reserve.liquidation_threshold < 0.75:
-                risk_score += 20
-            
-            if total_exposure > 0 and top_borrowers:
-                concentration = (top_borrowers[0].total_collateral_usd or 0) / total_exposure
-                if concentration > 0.5:
-                    risk_score += 15
-            
             metrics.append({
                 "token_symbol": reserve.token_symbol,
+                "token_address": reserve.token_address,
                 "chain": reserve.chain,
                 "utilization_rate": round(utilization, 4),
                 "ltv": reserve.ltv,
                 "liquidation_threshold": reserve.liquidation_threshold,
-                "liquidation_bonus": reserve.liquidation_bonus,
-                "supply_apy": round(reserve.supply_apy or 0, 2),
-                "borrow_apy": round(reserve.borrow_apy or 0, 2),
-                "is_frozen": reserve.is_frozen,
-                "borrowing_enabled": reserve.borrowing_enabled,
-                "price_usd": reserve.price_usd,
                 "total_exposure_usd": round(total_exposure, 2),
-                "position_count": len(asset_positions),
-                "top_borrower_exposure": round(top_borrowers[0].total_collateral_usd or 0, 2) if top_borrowers else 0,
                 "risk_score": risk_score,
                 "risk_level": "HIGH" if risk_score >= 50 else "MEDIUM" if risk_score >= 30 else "LOW"
             })
@@ -1588,6 +1510,8 @@ async def get_reserve_risk_metrics(
         
         return {
             "reserves_analyzed": len(metrics),
+            "chains_analyzed": chain_filter,
+            "supported_chains_only": True,
             "high_risk_count": len([m for m in metrics if m['risk_level'] == 'HIGH']),
             "metrics": metrics,
             "timestamp": datetime.now(timezone.utc)
@@ -1595,7 +1519,7 @@ async def get_reserve_risk_metrics(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
-
+    
 # ==================== LIQUIDATION TRENDS ====================
 
 @router_v1.get("/liquidation_trends")
@@ -1604,19 +1528,22 @@ async def get_liquidation_trends(
     chains: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Identify liquidation patterns and predict new liquidation zones"""
+    """Liquidation patterns - FIXED to filter supported chains"""
     try:
-        chain_filter = [c.strip().lower() for c in chains.split(',')] if chains else None
+        # FIXED: Default to supported chains
+        if chains:
+            chain_filter = [c.strip().lower() for c in chains.split(',')]
+        else:
+            chain_filter = SUPPORTED_CHAINS
         
         now = datetime.now()
         cutoff_7d = now - timedelta(days=days)
         cutoff_24h = now - timedelta(days=1)
 
         liq_query = db.query(LiquidationHistory).filter(
-            LiquidationHistory.liquidation_date >= cutoff_7d
+            LiquidationHistory.liquidation_date >= cutoff_7d,
+            LiquidationHistory.chain.in_(chain_filter)
         )
-        if chain_filter:
-            liq_query = liq_query.filter(LiquidationHistory.chain.in_(chain_filter))
         
         liquidations_7d = liq_query.all()
         liquidations_24h = [l for l in liquidations_7d if l.liquidation_date >= cutoff_24h]
@@ -1624,51 +1551,16 @@ async def get_liquidation_trends(
         total_volume_7d = sum(l.liquidated_collateral_usd or 0 for l in liquidations_7d)
         total_volume_24h = sum(l.liquidated_collateral_usd or 0 for l in liquidations_24h)
         
-        asset_counter = Counter(l.collateral_symbol for l in liquidations_7d if l.collateral_symbol)
-        top_assets = [
-            {"asset": asset, "count": count}
-            for asset, count in asset_counter.most_common(10)
-        ]
-        
-        hfs_before = [l.health_factor_before for l in liquidations_7d 
-                     if l.health_factor_before and l.health_factor_before < 1000]
-        avg_hf_before = sum(hfs_before) / len(hfs_before) if hfs_before else None
-        
-        chain_counter = Counter(l.chain for l in liquidations_7d if l.chain)
-        chain_distribution = [
-            {
-                "chain": chain, 
-                "count": count, 
-                "percentage": round(count / len(liquidations_7d) * 100, 2) if liquidations_7d else 0
-            }
-            for chain, count in chain_counter.most_common()
-        ]
-        
-        daily_avg_7d = len(liquidations_7d) / days if liquidations_7d else 0
-        trend = "STABLE"
-        if liquidations_24h:
-            if len(liquidations_24h) > daily_avg_7d * 1.2:
-                trend = "INCREASING"
-            elif len(liquidations_24h) < daily_avg_7d * 0.8:
-                trend = "DECREASING"
-        
-        result = {
+        return {
             "period_days": days,
+            "chains_analyzed": chain_filter,
+            "supported_chains_only": True,
             "liquidations_24h": len(liquidations_24h),
             "liquidations_7d": len(liquidations_7d),
             "liquidation_volume_usd_24h": round(total_volume_24h, 2),
             "liquidation_volume_usd_7d": round(total_volume_7d, 2),
-            "top_liquidated_assets": top_assets,
-            "chain_distribution": chain_distribution,
-            "trend": trend,
-            "daily_average_7d": round(daily_avg_7d, 2),
             "timestamp": datetime.now(timezone.utc)
         }
-        
-        if avg_hf_before is not None:
-            result["average_health_factor_before"] = round(avg_hf_before, 3)
-        
-        return result
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
@@ -1677,14 +1569,19 @@ async def get_liquidation_trends(
 
 @router_v1.get("/crosschain_risk_comparison")
 async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
-    """Compare risk metrics across all Aave deployments"""
+    """Compare risk metrics across all Aave deployments - FIXED"""
     try:
-        positions = db.query(Position).all()
+        # FIXED: Only query supported chains
+        positions = db.query(Position).filter(
+            Position.chain.in_(SUPPORTED_CHAINS)
+        ).all()
         
         subq = db.query(
             Reserve.chain,
             Reserve.token_address,
             func.max(Reserve.query_time).label('max_time')
+        ).filter(
+            Reserve.chain.in_(SUPPORTED_CHAINS)
         ).group_by(Reserve.chain, Reserve.token_address).subquery()
         
         reserves = db.query(Reserve).join(
@@ -1692,14 +1589,19 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
             (Reserve.chain == subq.c.chain) &
             (Reserve.token_address == subq.c.token_address) &
             (Reserve.query_time == subq.c.max_time)
-        ).filter(Reserve.is_active == True).all()
+        ).filter(
+            Reserve.is_active == True,
+            Reserve.chain.in_(SUPPORTED_CHAINS)
+        ).all()
         
         week_ago = datetime.now(timezone.utc) - timedelta(days=7)
         liquidations = db.query(LiquidationHistory).filter(
-            LiquidationHistory.liquidation_date >= week_ago
+            LiquidationHistory.liquidation_date >= week_ago,
+            LiquidationHistory.chain.in_(SUPPORTED_CHAINS)
         ).all()
         
-        chains = set(p.chain for p in positions if p.chain)
+        # Only iterate over supported chains
+        chains = set(p.chain for p in positions if p.chain in SUPPORTED_CHAINS)
         
         comparison = []
         
@@ -1716,11 +1618,6 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
             total_debt = sum(p.total_debt_usd or 0 for p in chain_positions)
             debt_ratio = total_debt / total_collateral if total_collateral > 0 else 0
             
-            token_counter = Counter(p.token_symbol for p in chain_positions if p.token_symbol)
-            top_tokens = [token for token, _ in token_counter.most_common(5)]
-            
-            risky_reserves = [r for r in chain_reserves if r.liquidation_threshold and r.liquidation_threshold < avg_hf]
-            
             comparison.append({
                 "chain": chain,
                 "average_health_factor": round(avg_hf, 3),
@@ -1729,9 +1626,6 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
                 "total_collateral_usd": round(total_collateral, 2),
                 "total_debt_usd": round(total_debt, 2),
                 "liquidations_7d": len(chain_liqs),
-                "top_collateral_tokens": top_tokens,
-                "reserves_count": len(chain_reserves),
-                "risky_reserves_count": len(risky_reserves),
                 "safety_score": round((avg_hf / debt_ratio) if debt_ratio > 0 else 100, 2)
             })
         
@@ -1739,6 +1633,7 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
         
         return {
             "chains_analyzed": len(comparison),
+            "supported_chains_only": True,
             "safest_chain": comparison[0]['chain'] if comparison else None,
             "riskiest_chain": comparison[-1]['chain'] if comparison else None,
             "comparison": comparison,
@@ -1752,11 +1647,13 @@ async def get_crosschain_risk_comparison(db: Session = Depends(get_db)):
 
 @router_v1.get("/risk_alerts_feed")
 async def get_risk_alerts_feed(
+    password: str = Query(..., description="Admin password"),
+    _verified: bool = Depends(verify_admin_password),
     severity: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db)
 ):
-    """Real-time risk alert feed with proper LT handling"""
+    """Risk alerts feed - ⚠️ Requires admin password"""
     try:
         alerts = []
         
@@ -1859,14 +1756,15 @@ async def get_risk_alerts_feed(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
-# FIX 11: Fixed /protocol/risky-borrowers
 @router_v1.get("/protocol/risky-borrowers")
 async def get_risky_borrowers_summary(
+    password: str = Query(..., description="Admin password"),
+    _verified: bool = Depends(verify_admin_password),
     threshold: float = 1.5,
     chains: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Get count of risky borrowers - FIXED"""
+    """Risky borrowers summary - ⚠️ Requires admin password"""
     try:
         query = db.query(Position).filter(
             Position.enhanced_health_factor < threshold,
@@ -1949,6 +1847,7 @@ def startup_status():
         "database_url_set": bool(os.getenv("DATABASE_URL")),
         "services_initialized": portfolio_service is not None
     }
+
    
 # ==================== V2 USER MANAGEMENT ====================
 
@@ -2232,6 +2131,267 @@ async def get_liquidation_history(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
 
+"""
+Add these endpoints to your consolidated_api.py file
+Place them in the router_v1 section (around line 500-600, after existing endpoints)
+"""
+
+# ============================================================
+# MISSING ENDPOINT 1: Quick Stats for Overview
+# ============================================================
+@router_v1.get("/data/quick-stats")
+async def get_quick_stats(db: Session = Depends(get_db)):
+    """
+    Quick statistics for dashboard overview
+    Returns: Total positions, collateral, at-risk positions, critical positions
+    """
+    try:
+        # Total positions count
+        total_positions = db.query(Position).count()
+        
+        # Total collateral
+        total_collateral = db.query(
+            func.sum(Position.total_collateral_usd)
+        ).scalar() or 0
+        
+        # At-risk positions (HF < 1.5 and has debt)
+        at_risk_positions = db.query(Position).filter(
+            Position.enhanced_health_factor < 1.5,
+            Position.enhanced_health_factor > 0,
+            Position.total_debt_usd > 0
+        ).count()
+        
+        # Critical positions (HF < 1.1 and has debt)
+        critical_positions = db.query(Position).filter(
+            Position.enhanced_health_factor < 1.1,
+            Position.enhanced_health_factor > 0,
+            Position.total_debt_usd > 0
+        ).count()
+        
+        return {
+            "positions": total_positions,
+            "total_collateral_usd": round(total_collateral, 2),
+            "at_risk_positions": at_risk_positions,
+            "critical_positions": critical_positions,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Quick stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# MISSING ENDPOINT 2: Admin Cache Clear
+# ============================================================
+
+@router_v1.post("/admin/cache/clear")
+async def admin_clear_cache(
+    password: str = Query(..., description="Admin password"),
+    db: Session = Depends(get_db)
+):
+    """
+    Clear all cached data (requires admin password)
+    Clears portfolio cache and any other cached data
+    """
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_me_in_production")
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=403, detail="Invalid admin password")
+    
+    try:
+        cleared_count = 0
+        
+        # Clear portfolio service cache if available
+        if portfolio_service and hasattr(portfolio_service, 'cache'):
+            cache_dir = portfolio_service.cache.cache_dir
+            if os.path.exists(cache_dir):
+                for filename in os.listdir(cache_dir):
+                    if filename.endswith('.json'):
+                        os.remove(os.path.join(cache_dir, filename))
+                        cleared_count += 1
+        
+        return {
+            "success": True,
+            "message": f"Cache cleared successfully ({cleared_count} entries removed)",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Cache clear error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# MISSING ENDPOINT 3: Admin Settings View
+# ============================================================
+@router_v1.get("/admin/settings")
+async def get_admin_settings(
+    password: str = Query(..., description="Admin password")
+):
+    """
+    Get current system settings and status
+    Requires admin password for security
+    """
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_me_in_production")
+    
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=403, detail="Invalid admin password")
+    
+    try:
+        # Get database connection status
+        db_connected = False
+        try:
+            db = SessionLocal()
+            db.execute(text("SELECT 1"))
+            db_connected = True
+            db.close()
+        except:
+            pass
+        
+        return {
+            "cache_ttl_minutes": 15,
+            "supported_chains": list(AaveRPCReserveFetcher.RPC_ENDPOINTS.keys()),
+            "database_connected": db_connected,
+            "services_running": {
+                "portfolio_service": portfolio_service is not None,
+                "alert_service": alert_service is not None
+            },
+            "api_version": "2.0.0",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Settings error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# ENHANCED ENDPOINT: Positions with Token Address
+# Already exists but needs token_address in response
+# Update the existing /positions endpoint response to include:
+# ============================================================
+"""
+In the existing @router_v1.get("/positions") endpoint, update the return statement to:
+
+return [
+    {
+        "borrower_address": p.borrower_address,
+        "chain": p.chain,
+        "token_symbol": p.token_symbol,
+        "token_address": p.token_address,  # ADD THIS LINE
+        "collateral_amount": p.collateral_amount,
+        "debt_amount": p.debt_amount if p.debt_amount and p.debt_amount > 0 else None,
+        "collateral_usd": round(p.total_collateral_usd or 0, 2),
+        "debt_usd": round(p.total_debt_usd or 0, 2),
+        "enhanced_health_factor": p.enhanced_health_factor,
+        "risk_category": p.risk_category or get_risk_category(p.enhanced_health_factor),
+        "last_updated": p.last_updated
+    }
+    for p in positions[:limit]
+]
+"""
+
+
+# ============================================================
+# ENHANCED ENDPOINT: Reserves with Token Address
+# Already exists but make sure token_address is in response
+# ============================================================
+"""
+In the existing @router_v1.get("/reserves/rpc") endpoint, the response already includes
+token_address, so no changes needed. Just verify it's there:
+
+"reserves": [
+    {
+        "chain": r.chain,
+        "token_symbol": r.token_symbol,
+        "token_address": r.token_address,  # Should already be here
+        "ltv": round(r.ltv or 0, 4),
+        ...
+    }
+]
+"""
+
+
+# ============================================================
+# ENHANCED ENDPOINT: Reserve Risk Metrics with Token Address
+# Update existing endpoint to include token_address
+# ============================================================
+"""
+In the existing @router_v1.get("/reserve_risk_metrics") endpoint,
+update the metrics.append() to include token_address:
+
+metrics.append({
+    "token_symbol": reserve.token_symbol,
+    "token_address": reserve.token_address,  # ADD THIS LINE
+    "chain": reserve.chain,
+    "utilization_rate": round(utilization, 4),
+    ...
+})
+"""
+
+
+# ============================================================
+# OPTIONAL: Cache Statistics Endpoint
+# ============================================================
+@router_v1.get("/cache/stats")
+async def get_cache_statistics():
+    """
+    Get cache statistics (public endpoint, no auth required)
+    Shows cache usage and health
+    """
+    try:
+        if not portfolio_service or not hasattr(portfolio_service, 'cache'):
+            return {
+                "cache_enabled": False,
+                "message": "Cache not available"
+            }
+        
+        cache_dir = portfolio_service.cache.cache_dir
+        
+        if not os.path.exists(cache_dir):
+            return {
+                "cache_enabled": True,
+                "total_cached_entries": 0,
+                "cache_size_mb": 0,
+                "cache_directory": cache_dir
+            }
+        
+        cache_files = [f for f in os.listdir(cache_dir) if f.endswith('.json')]
+        
+        total_size = 0
+        valid_entries = 0
+        expired_entries = 0
+        
+        for filename in cache_files:
+            filepath = os.path.join(cache_dir, filename)
+            total_size += os.path.getsize(filepath)
+            
+            try:
+                with open(filepath, 'r') as f:
+                    cached_data = json.load(f)
+                cached_time = datetime.fromisoformat(cached_data['cached_at'])
+                
+                if datetime.now(timezone.utc) - cached_time > portfolio_service.cache.cache_ttl:
+                    expired_entries += 1
+                else:
+                    valid_entries += 1
+            except:
+                expired_entries += 1
+        
+        return {
+            "cache_enabled": True,
+            "total_cached_entries": len(cache_files),
+            "valid_entries": valid_entries,
+            "expired_entries": expired_entries,
+            "cache_size_mb": round(total_size / (1024 * 1024), 2),
+            "cache_directory": cache_dir,
+            "cache_ttl_minutes": portfolio_service.cache.cache_ttl.total_seconds() / 60,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Cache stats error: {e}")
+        return {
+            "cache_enabled": False,
+            "error": str(e)
+        }
 # ============================================================
 # COMPLETE UPDATED VIEW_PORTFOLIO ENDPOINT WITH ALL FIXES
 # ============================================================
@@ -2708,8 +2868,12 @@ class CacheInvalidateRequest(BaseModel):
     chain: Optional[str] = None  # If None, invalidate all chains for wallet
 
 @router_v2.post("/portfolio/cache/invalidate")
-async def invalidate_portfolio_cache(request: CacheInvalidateRequest):
-    """Manually invalidate cache for a specific wallet"""
+async def invalidate_portfolio_cache(
+    request: CacheInvalidateRequest,
+    password: str = Query(..., description="Admin password"),
+    _verified: bool = Depends(verify_admin_password)
+):
+    """Invalidate cache for specific wallet - ⚠️ Requires admin password"""
     try:
         if not portfolio_service:
             raise HTTPException(status_code=503, detail="Portfolio service not initialized")
@@ -2753,8 +2917,11 @@ async def invalidate_portfolio_cache(request: CacheInvalidateRequest):
 
 
 @router_v2.get("/portfolio/cache/stats")
-async def get_cache_stats():
-    """Get cache statistics"""
+async def get_cache_stats(
+    password: str = Query(..., description="Admin password"),
+    _verified: bool = Depends(verify_admin_password)
+):
+    """Get cache statistics - ⚠️ Requires admin password"""
     try:
         if not portfolio_service:
             raise HTTPException(status_code=503, detail="Portfolio service not initialized")
@@ -2804,8 +2971,11 @@ async def get_cache_stats():
 
 
 @router_v2.post("/portfolio/cache/cleanup")
-async def cleanup_cache():
-    """Manually trigger cache cleanup (remove expired entries)"""
+async def cleanup_cache(
+    password: str = Query(..., description="Admin password"),
+    _verified: bool = Depends(verify_admin_password)
+):
+    """Cleanup expired cache - ⚠️ Requires admin password"""
     try:
         if not portfolio_service:
             raise HTTPException(status_code=503, detail="Portfolio service not initialized")
@@ -2897,4 +3067,4 @@ async def get_chains_info():
         'chains': chains_info
     }
             
-__all__ = ['router_v1', 'router_v2', 'init_services']
+__all__ = ['router_v1', 'router_v2', 'init_services', 'SUPPORTED_CHAINS']
